@@ -1,7 +1,9 @@
 # AI use disclosure
 
-An AI model (Claude, by Anthropic) wrote much of this project's code and
-documentation, under the maintainer's direction.
+An AI model (Claude, by Anthropic) wrote this project's own code and most
+of its documentation, under the maintainer's direction. Code from upstream
+projects and libraries was written by their authors, who are credited in
+the README.
 
 Changes are built and tested by the maintainer before they are kept, on a
 real FunKey S wherever they can be tested there. Prompts, chat transcripts
