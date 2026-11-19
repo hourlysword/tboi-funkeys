@@ -1,0 +1,589 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Sun, 15 Nov 2026 21:08:41 -0500
+Subject: [PATCH] FunKey S: shorter room entries, memory that no longer creeps
+ up
+
+Room entries: a room's floor and walls are drawn into its bitmap from shapes parsed on demand under a 5 MB budget, and
+45% of the parses were of shapes parsed before and dropped. Half of a parsed shape was the second copy of its edges
+kept for exact hit tests (asked for twice in a whole run) and its vectors kept their growth slack: the hit-test edges
+are now made only when a hit test needs them (shapeEnsureHit) and every vector is trimmed, so the budget holds about
+twice as many shapes. Joining edges into paths uses a sorted array instead of a hash multimap (one allocation per
+edge). On the console: ticks over 150 ms after the title 18 -> 12, over 300 ms 6 -> 2, parsing in the 7-minute play
+script 4.2 -> 2.2 s; the same pictures, pixel for pixel.
+
+Memory: lean loading kept every sprite timeline it parsed, for each kind of enemy, effect or item seen (about 10 MB
+after eight floors). The timelines of sprites with no clip left (counted per sprite) and none made in the last 2
+seconds are now dropped above g_timelineBudgetBytes (3 MB on the FunKey), least recently used first, and parsed again
+from the same tags when needed; sprites with a sound stream are kept. Clip names given by scripts (attachMovie,
+createEmptyMovieClip) are interned weakly like the automatic instance names (atomOfWeak): the game's sound function
+names a clip "sz" and a counter for every sound, and those stayed for good. The heap in use over a 22-minute workload
+on the PC stays at 32-35 MB instead of growing from 30 to 42; on the console the game's memory levels off at about
+45 MB.
+
+Diagnostics in the log: a "long tick" line for ticks over 150 ms (ISAAC_FUNKEY_SLOWMS) with what it was spent on, a
+"memory at tick" line every 1800 ticks (ISAAC_FUNKEY_MEMEVERY), totals when the game ends. Testing:
+ISAAC_FUNKEY_CENSUS (a full collection first, the heap by kind, interned strings by pattern), ISAAC_FUNKEY_NOWAIT,
+ISAAC_TIMELINE_KB, ISAAC_SHAPE_KB, ISAAC_LEAF_SUB, ISAAC_LEAF_REPEAT, ISAAC_LEANREAD_LOG.
+---
+ rt/builtins.cpp |   4 +-
+ rt/core.cpp     |  45 ++++++++++++++++++++-
+ rt/core.h       |   5 +++
+ rt/display.cpp  |   6 ++-
+ rt/display.h    |   1 +
+ rt/funkey.cpp   |  41 ++++++++++++++++++-
+ rt/main.cpp     |   5 +++
+ rt/raster.cpp   |  20 +++++++++-
+ rt/swfdata.h    |   8 +++-
+ rt/swfload.cpp  | 104 +++++++++++++++++++++++++++++++++++++++++++-----
+ 10 files changed, 218 insertions(+), 21 deletions(-)
+
+diff --git a/rt/builtins.cpp b/rt/builtins.cpp
+index 130014c..6e78930 100644
+--- a/rt/builtins.cpp
++++ b/rt/builtins.cpp
+@@ -277,12 +277,12 @@ static Value mc_prevFrame(Act& a, Value t, int, Value*) { if (MovieClip* c = asC
+ static Value mc_attachMovie(Act&, Value t, int argc, Value* argv) {
+     MovieClip* c = asClip(t); if (!c || argc < 3) return VUNDEF;
+     Object* init = argc > 3 && argv[3].isObj() ? argv[3].o : nullptr;
+-    MovieClip* r = attachMovie(c, toStr(argv[0])->s, atomOf(toStr(argv[1])), toInt32(argv[2]), init);
++    MovieClip* r = attachMovie(c, toStr(argv[0])->s, atomOfWeak(toStr(argv[1])), toInt32(argv[2]), init);
+     return r ? Value((Object*)r) : VUNDEF;
+ }
+ static Value mc_createEmpty(Act&, Value t, int argc, Value* argv) {
+     MovieClip* c = asClip(t); if (!c || argc < 2) return VUNDEF;
+-    return Value((Object*)createEmptyMovieClip(c, atomOf(toStr(argv[0])), toInt32(argv[1])));
++    return Value((Object*)createEmptyMovieClip(c, atomOfWeak(toStr(argv[0])), toInt32(argv[1])));
+ }
+ static Value mc_remove(Act&, Value t, int, Value*) { if (DisplayObject* d = asDO(t)) removeMovieClip(d); return VUNDEF; }
+ static Value mc_swapDepths(Act&, Value t, int argc, Value* argv) { if (DisplayObject* d = asDO(t)) swapDepths(d, arg(argc, argv, 0)); return VUNDEF; }
+diff --git a/rt/core.cpp b/rt/core.cpp
+index 6db1f67..9a1f287 100644
+--- a/rt/core.cpp
++++ b/rt/core.cpp
+@@ -68,6 +68,13 @@ double g_gcMs = 0;   // accumulated time spent in the collector (F3 diagnostics)
+ static constexpr double kGcTickTargetMs = 12.0;
+ bool (*g_gcMemPressure)() = nullptr;   // (PSP) true when memory runs low: collect now
+ void gcStats(size_t* objects, size_t* lastLive, size_t* extBytes) { *objects = g_heap.size(); *lastLive = g_lastLive; *extBytes = g_extBytes; }
++static bool g_gcForce = false;
++// (diagnostics) a whole collection now, the garbage freed at once: what is left is what is alive
++void gcCollectFull() {
++    while (!g_sweep.empty()) sweepSome(1e9);
++    g_gcForce = true; gcCollect(0); g_gcForce = false;
++    while (!g_sweep.empty()) sweepSome(1e9);
++}
+ void gcCollect(double tickMs) {
+     if (!g_sweep.empty()) {   // a few ms per tick until done
+         auto s0 = std::chrono::steady_clock::now();
+@@ -81,9 +88,9 @@ void gcCollect(double tickMs) {
+     }
+     size_t trig = (size_t)(std::max(g_lastLive, g_lim.gcMinLive) * g_lim.gcGrowth);
+     bool pressure = g_gcMemPressure && g_heap.size() > g_lim.gcMinLive / 2 && g_gcMemPressure();
+-    if (g_heap.size() < trig && g_extBytes < g_lim.extGcBytes && !pressure) return;
++    if (g_heap.size() < trig && g_extBytes < g_lim.extGcBytes && !pressure && !g_gcForce) return;
+     // a heavy tick (room load, explosion...) postpones the mark to a lighter one, unless the heap is far over
+-    if (tickMs > kGcTickTargetMs * 0.6 && g_heap.size() < trig + trig / 2 && !pressure) return;
++    if (tickMs > kGcTickTargetMs * 0.6 && g_heap.size() < trig + trig / 2 && !pressure && !g_gcForce) return;
+     g_extBytes = 0;
+     auto t0 = std::chrono::steady_clock::now(); size_t before = g_heap.size();
+     Tracer tr;
+@@ -195,6 +202,40 @@ Str* internWeak(std::string_view sv) {
+     return s;
+ }
+ static void internForget(Str* s) { auto it = g_intern->find(std::string_view(s->s)); if (it != g_intern->end() && it->second == s) g_intern->erase(it); }
++size_t internCount() { return g_intern ? g_intern->size() : 0; }   // (diagnostics)
++// (diagnostics) the interned strings by pattern (digits as #): the commonest, "count pattern" per line
++std::string internPatterns(size_t top) {
++    std::unordered_map<std::string, size_t> pat;
++    if (g_intern) for (auto& kv : *g_intern) {
++        std::string p; bool dig = false;
++        for (char c : kv.first.substr(0, 40)) { if (c >= '0' && c <= '9') { if (!dig) p += '#'; dig = true; } else { p += c; dig = false; } }
++        pat[p + (kv.second->weakAtom ? " (weak)" : "")]++;
++    }
++    std::vector<std::pair<size_t, std::string>> v; for (auto& kv : pat) v.push_back({kv.second, kv.first});
++    std::sort(v.rbegin(), v.rend());
++    std::string out;
++    for (size_t i = 0; i < v.size() && i < top; i++) out += std::to_string(v[i].first) + " " + v[i].second + "\n";
++    return out;
++}
++// (diagnostics) what the collected heap holds: strings (all, interned) and their bytes, objects by kind, their
++// properties, arrays and their elements, scopes
++std::string gcCensus() {
++    size_t nStr = 0, strB = 0, nInt = 0, intB = 0, nObj = 0, props = 0, nArr = 0, arrEl = 0, nScope = 0, nDisp = 0, nFn = 0;
++    for (GcObj* o : g_heap) {
++        if (Str* s = dynamic_cast<Str*>(o)) { nStr++; strB += s->s.capacity(); if (s->interned) { nInt++; intB += s->s.capacity(); } continue; }
++        if (dynamic_cast<Scope*>(o)) { nScope++; continue; }
++        if (Object* ob = dynamic_cast<Object*>(o)) {
++            nObj++; props += ob->props.v.capacity();
++            if (ob->isDisplay()) nDisp++;
++            if (ob->kind == OK_FUNCTION) nFn++;
++            if (Array* a = dynamic_cast<Array*>(ob)) { nArr++; arrEl += a->el.capacity() + a->ord.capacity() / 4; }
++        }
++    }
++    char b[320];
++    snprintf(b, sizeof b, "strings %zu (%zu KB; interned %zu, %zu KB), objects %zu (display %zu, functions %zu) with %zu property slots, arrays %zu with %zu element slots, scopes %zu",
++             nStr, strB >> 10, nInt, intB >> 10, nObj, nDisp, nFn, props, nArr, arrEl, nScope);
++    return b;
++}
+ static std::unordered_map<std::string, size_t>* g_strProf;
+ static void strProfDump() {
+     std::vector<std::pair<size_t, std::string>> v; for (auto& kv : *g_strProf) v.push_back({kv.second, kv.first});
+diff --git a/rt/core.h b/rt/core.h
+index fc175b0..0570196 100644
+--- a/rt/core.h
++++ b/rt/core.h
+@@ -62,6 +62,11 @@ Str* intern(std::string_view sv);
+ Str* mkstr(std::string s);                  // dynamic string (not interned)
+ Str* internWeak(std::string_view sv);       // interned, but freed when nothing references it (until a script uses it as a key)
+ inline Str* atomOf(Str* s) { if (s->interned) { if (s->weakAtom) { s->weakAtom = 0; s->pinned = 1; } return s; } if (!s->atom) s->atom = intern(s->s); return s->atom; }
++// A clip's name given by a script (attachMovie, createEmptyMovieClip): interned weakly, as the automatic instance
++// names, so that it goes with the clip unless a script uses it as a key (which pins it). The game's sounds each make a
++// clip named "sz" and a counter: pinned, those names grew by about 25,000 an hour. Not cached in s->atom: the weak
++// atom may be freed while s lives.
++inline Str* atomOfWeak(Str* s) { if (s->interned) return s; if (s->atom) return s->atom; return internWeak(s->s); }
+ 
+ // ---------------------------------------------------------------- Values
+ enum VT : uint8_t { T_UNDEF = 0, T_NULL, T_BOOL, T_NUM, T_STR, T_OBJ, T_HOLE };
+diff --git a/rt/display.cpp b/rt/display.cpp
+index 3ff19d0..75f1730 100644
+--- a/rt/display.cpp
++++ b/rt/display.cpp
+@@ -59,6 +59,7 @@ void DisplayObject::trace(Tracer& tr) { Object::trace(tr); tr.mark(parent); tr.m
+ void BitmapObj::trace(Tracer& tr) { DisplayObject::trace(tr); tr.mark(bd); }
+ void ButtonObj::trace(Tracer& tr) { DisplayObject::trace(tr); for (auto* k : kids) tr.mark(k); for (auto* k : hitKids) tr.mark(k); }
+ void MovieClip::trace(Tracer& tr) { DisplayObject::trace(tr); for (auto* k : kids) tr.mark(k); tr.mark(tscope); tr.mark(execNext); }
++MovieClip::~MovieClip() { if (def && def->instances) def->instances--; }
+ 
+ // ============================================================ Children
+ DisplayObject* MovieClip::childAtDepth(int d) const {
+@@ -302,6 +303,7 @@ MovieClip* newClip(SpriteDef* def) {
+     spriteEnsure(def);
+     MovieClip* c = gcNew<MovieClip>();
+     c->kind = OK_CLIP; c->proto = protos::movieclip; c->def = def; c->charId = def->id;
++    def->instances++;
+     return c;
+ }
+ 
+@@ -969,7 +971,7 @@ static bool hitShape(DisplayObject* d, const Mat& world, double gx, double gy, b
+         ShapeDef* s = (ShapeDef*)((ShapeObj*)d)->def;
+         if (lx < s->bounds.x0 || lx > s->bounds.x1 || ly < s->bounds.y0 || ly > s->bounds.y1) return false;
+         if (!shapeFlag) return true;
+-        shapeEnsure(s);
++        shapeEnsureHit(s);
+         // global point in whole twips (as Ruffle), then local twips rounded
+         double tgx = std::round(gx * 20.0) / 20.0, tgy = std::round(gy * 20.0) / 20.0;
+         inv.apply(tgx, tgy, lx, ly);
+@@ -985,7 +987,7 @@ static void hitDebugRec(DisplayObject* d, const Mat& world, double gx, double gy
+     Mat inv; if (!world.invert(inv)) return;
+     double lx, ly; inv.apply(gx, gy, lx, ly);
+     if (d->kind == OK_SHAPE) {
+-        ShapeDef* s = (ShapeDef*)((ShapeObj*)d)->def; shapeEnsure(s);
++        ShapeDef* s = (ShapeDef*)((ShapeObj*)d)->def; shapeEnsureHit(s);
+         if (lx < s->bounds.x0 || lx > s->bounds.x1 || ly < s->bounds.y0 || ly > s->bounds.y1) return;
+         logf("[hitdbg] %s shape %d local %.4f %.4f vis=%d poly=%d exact=%d\n", targetPath(d->parent)->s.c_str(), s->id, lx, ly, (int)d->visible,
+              (int)pointInPolys(shapeHitPolys(s), lx, ly), (int)hitShape(d, world, gx, gy, true));
+diff --git a/rt/display.h b/rt/display.h
+index 22d1646..19493fa 100644
+--- a/rt/display.h
++++ b/rt/display.h
+@@ -86,6 +86,7 @@ struct MovieClip final : DisplayObject {
+     int lastStreamFrame = -1;
+     int reqFrame = 0;             // the frame last asked for with gotoAndStop / gotoAndPlay (it may be past the last one)
+     void trace(Tracer& tr) override;
++    ~MovieClip() override;        // (one clip fewer of its sprite: lean loading may drop the sprite's parsed timeline)
+ 
+     DisplayObject* childAtDepth(int d) const;
+     void insertChild(DisplayObject* c);
+diff --git a/rt/funkey.cpp b/rt/funkey.cpp
+index 2628173..c358b01 100644
+--- a/rt/funkey.cpp
++++ b/rt/funkey.cpp
+@@ -45,6 +45,9 @@
+ #include <sys/wait.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#if defined(__GLIBC__)
++#include <malloc.h>   // (mallinfo2: the heap in use, on a PC)
++#endif
+ #include <termios.h>
+ #include <ucontext.h>
+ #include <unistd.h>
+@@ -77,6 +80,12 @@ const uint32_t* renderSoftOutput(int* w, int* h);
+ void leanStats(size_t* shapeBytes, size_t* soundBytes); void renderMemStats(size_t* pages, size_t* bitmaps);
+ extern bool g_softStretch;           // (render_soft.cpp) the picture across the whole screen
+ void audioSetPaused(bool paused);    // (audio.cpp)
++extern double g_bmDrawMs, g_lazyParseMs, g_leafRasterMs; extern uint64_t g_leafMisses, g_leafHits;   // (raster.cpp, swfload.cpp)
++extern double g_leanReadMs; extern uint64_t g_leanReads, g_leanReadBytes; extern uint32_t g_shapeParses, g_shapeHitParses;
++void gcStats(size_t* objects, size_t* lastLive, size_t* extBytes); size_t internCount();             // (core.cpp)
++std::string gcCensus(); std::string internPatterns(size_t top); void gcCollectFull();
++extern size_t g_timelineBytes, g_timelines, g_timelineDrops;
++void rasterMemNumbers(size_t* bmBytes, size_t* morphs, size_t* morphBytes, size_t* leaves, size_t* leafBytes);
+ 
+ namespace {
+ double now() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
+@@ -831,6 +840,7 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+         }
+ 
+         // one logic tick
++        const double bm0 = g_bmDrawMs, lp0 = g_lazyParseMs, lr0 = g_leafRasterMs, rd0 = g_leanReadMs; const uint64_t lm0 = g_leafMisses, lh0 = g_leafHits, rn0 = g_leanReads;
+         g_player.timeMs = scripted ? g_player.tick * 1000.0 / g_frameRate : (now() - clockStart) * 1000.0;
+         if (marks) logf("OFKMEM begin %u\n", g_player.tick);
+         double t0 = now(), c0 = threadCpuMs();
+@@ -843,6 +853,7 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+ 
+         // the picture, unless behind the clock (never more than 3 in a row skipped)
+         bool behind = t1 > next + dt;
++        double pictureMs = 0;
+         if (!behind || skipped >= 3) {
+             if (marks) logf("OFKMEM dbegin %u\n", g_player.tick);
+             double d0 = now(), dc0 = threadCpuMs();
+@@ -858,6 +869,7 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+             double d2 = now();
+             if (marks) logf("OFKMEM draw %u ms %.3f cpu %.3f rasters %d quads %d present %.3f\n", g_player.tick, (d2 - d0) * 1000, threadCpuMs() - dc0, g_rstats.rasters, g_rstats.quads, (d2 - d1) * 1000);
+             w.draw += (d1 - d0) * 1000; w.present += (d2 - d1) * 1000; w.frames++; drawn++; fpsFrames++;
++            pictureMs = (d2 - d0) * 1000;
+             skipped = 0;
+         } else { skipped++; w.skipped++; fbKeepShown(); }
+ 
+@@ -875,11 +887,18 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+         double g1 = now();
+         w.gc += (g1 - g0) * 1000;
+         w.worst = std::max(w.worst, (g1 - t0) * 1000);
++        // a long tick (mostly a room entry): what it was spent on
++        static const double slowMs = getenv("ISAAC_FUNKEY_SLOWMS") ? atof(getenv("ISAAC_FUNKEY_SLOWMS")) : 150;
++        if ((g1 - t0) * 1000 > slowMs)
++            logf("[funkey] long tick %u: %.0f ms: logic %.0f (BitmapData.draw %.0f: %llu leaves rasterized in %.0f, %llu reused; parsing %.0f, of it %llu reads %.0f), picture %.0f, collector %.0f\n",
++                 g_player.tick - 1, (g1 - t0) * 1000, (t1 - t0) * 1000, g_bmDrawMs - bm0, (unsigned long long)(g_leafMisses - lm0), g_leafRasterMs - lr0,
++                 (unsigned long long)(g_leafHits - lh0), g_lazyParseMs - lp0, (unsigned long long)(g_leanReads - rn0), g_leanReadMs - rd0, pictureMs, (g1 - g0) * 1000);
+ 
+         // the clock: one tick every 1/30 s; a stall of more than half a second (a room being built) isn't caught up
+         next += dt;
+         double t = now();
+-        if (t < next) inputWait(next - t);
++        static const bool noWait = getenv("ISAAC_FUNKEY_NOWAIT") != nullptr;   // (testing: a test script as fast as it runs)
++        if (t < next) { if (!noWait) inputWait(next - t); }
+         else if (t > next + 0.5) { next = t; w.stalls++; }
+ 
+         if (t - fpsStart >= 1) {   // SHOW FPS (the menu): the pictures drawn in the last second
+@@ -887,6 +906,22 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+             perfLines = {a};
+             fpsFrames = 0; fpsStart = t;
+         }
++        // memory, part by part, every minute of play (1800 ticks; ISAAC_FUNKEY_MEMEVERY: another number of ticks)
++        static const uint32_t memEvery = getenv("ISAAC_FUNKEY_MEMEVERY") ? (uint32_t)atol(getenv("ISAAC_FUNKEY_MEMEVERY")) : 1800;
++        if (memEvery && g_player.tick % memEvery == 0) {
++            static const bool census = getenv("ISAAC_FUNKEY_CENSUS") != nullptr;   // (testing) the collected heap by kind
++            if (census) gcCollectFull();   // (only what is alive counted)
++            int rss, swap, avail; memInfo(rss, swap, avail);
++            size_t objs, live, ext, shp, snd, pages, bms, bmSurf, morphs, morphB, leaves, leafB;
++            gcStats(&objs, &live, &ext); leanStats(&shp, &snd); renderMemStats(&pages, &bms); rasterMemNumbers(&bmSurf, &morphs, &morphB, &leaves, &leafB);
++            char heap[64] = "";
++#if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 33)
++            snprintf(heap, sizeof heap, ", malloc in use %zu KB", mallinfo2().uordblks >> 10);
++#endif
++            logf("[funkey] memory at tick %u: rss %d KB, swap %d KB | GC objects %zu (live %zu), external %zu KB, interned strings %zu | parsed shapes %zu KB, timelines %zu KB (%zu parsed, %zu dropped), sounds %zu KB | renderer cache %zu KB, its bitmaps %zu KB | leaves %zu (%zu KB), morph shapes %zu (%zu KB), bitmap surfaces %zu KB%s\n",
++                 g_player.tick, rss, swap, objs, live, ext >> 10, internCount(), shp >> 10, g_timelineBytes >> 10, g_timelines, g_timelineDrops, snd >> 10, pages >> 10, bms >> 10, leaves, leafB >> 10, morphs, morphB >> 10, bmSurf >> 10, heap);
++            if (census) logf("[funkey] heap at tick %u: %s\n", g_player.tick, gcCensus().c_str());
++        }
+         if (t - winStart >= 5) {
+             int rss, swap, avail; memInfo(rss, swap, avail);
+             double secs = t - winStart; int n = std::max(1, w.ticks), nf = std::max(1, w.frames);
+@@ -895,6 +930,10 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+             w = Win(); winStart = t;
+         }
+     }
++    logf("[funkey] BitmapData.draw %.0f ms in all: %llu leaves rasterized in %.0f ms, %llu reused; parsing %.0f ms (shapes %u, their hit edges %u); shapes read from the game file: %llu, %llu KB in %.0f ms\n", g_bmDrawMs,
++         (unsigned long long)g_leafMisses, g_leafRasterMs, (unsigned long long)g_leafHits, g_lazyParseMs, g_shapeParses, g_shapeHitParses,
++         (unsigned long long)g_leanReads, (unsigned long long)(g_leanReadBytes >> 10), g_leanReadMs);
++    if (getenv("ISAAC_FUNKEY_CENSUS")) logf("[funkey] interned strings, the commonest patterns:\n%s", internPatterns(25).c_str());
+     if (g_powerReq) logf("[funkey] stopping for the power-off\n");
+     else if (g_stopReq) logf("[funkey] stopping: asked to\n");
+     else logf("[funkey] quitting (EXIT GAME in the menu, or the game)\n");
+diff --git a/rt/main.cpp b/rt/main.cpp
+index 180a18f..1f4ec81 100644
+--- a/rt/main.cpp
++++ b/rt/main.cpp
+@@ -71,6 +71,7 @@ int renderAtlasPages();
+ extern float g_audioVolume;
+ extern std::atomic<float> g_moveScale; extern bool g_joyAccel;
+ extern bool g_shapeEvict; extern size_t g_shapeBudgetBytes, g_soundCacheBytes; extern uint32_t g_shapeTick;
++extern size_t g_timelineBudgetBytes;
+ void rasterTrim(size_t budget);
+ #ifdef ISAAC_FUNKEY
+ void funkeyEarly(); uint64_t funkeyPlay(bool perfOverlay); void funkeyFinish();   // (funkey.cpp; funkeyPlay returns the pictures drawn)
+@@ -568,6 +569,10 @@ int main(int argc, char** argv) {
+     // with one thread using them: headless mode here, and the FunKey's own main loop), short sounds kept decoded 2 MB.
+     // Decoded SWF bitmaps are trimmed to 1.5 MB after every tick (below)
+     fl::g_shapeEvict = true; fl::g_shapeBudgetBytes = 5u << 20; fl::g_soundCacheBytes = 2u << 20;
++    if (const char* e = getenv("ISAAC_SHAPE_KB")) fl::g_shapeBudgetBytes = (size_t)atol(e) << 10;   // (testing)
++    // the sprites' parsed timelines: those of sprites without clips dropped above 3 MB (swfload.cpp, spriteEnsure)
++    fl::g_timelineBudgetBytes = 3u << 20;
++    if (const char* e = getenv("ISAAC_TIMELINE_KB")) fl::g_timelineBudgetBytes = (size_t)atol(e) << 10;   // (testing; 0: never)
+ #endif
+     loadConfig(base + "isaac.ini", cfg);
+     {   // mods: the "mods" folder next to the program (mods.h), turned on with `mods =` in isaac.ini
+diff --git a/rt/raster.cpp b/rt/raster.cpp
+index bb78898..60fccbe 100644
+--- a/rt/raster.cpp
++++ b/rt/raster.cpp
+@@ -522,7 +522,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
+     if (!leafIdent(d, def, variant)) return false;
+     RectF b; if (!contentBounds(d, b) || !b.valid()) return false;
+     double ftx = std::floor(m.tx), fty = std::floor(m.ty);
+-    const int kSub = 64;   // subpixel quantized to 1/64 px
++    static const int kSub = getenv("ISAAC_LEAF_SUB") ? std::max(1, atoi(getenv("ISAAC_LEAF_SUB"))) : 64;   // subpixel quantized to 1/64 px
+     int fx = (int)std::lround((m.tx - ftx) * kSub), fy = (int)std::lround((m.ty - fty) * kSub);
+     if (fx >= kSub) { fx = 0; ftx += 1; } if (fy >= kSub) { fy = 0; fty += 1; }
+     Mat mm = m; mm.tx = (double)fx / kSub; mm.ty = (double)fy / kSub;
+@@ -714,6 +714,7 @@ static void evictLeaves() {
+ }
+ 
+ double g_bmDrawMs = 0;   // (diagnostics) time in BitmapData.draw
++double g_leafRasterMs = 0; uint64_t g_leafMisses = 0, g_leafHits = 0;   // (diagnostics) leaves rasterized: time, count; reused
+ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx);
+ void bitmapDraw(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+     auto t0 = std::chrono::steady_clock::now();
+@@ -737,7 +738,10 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+         for (auto& p : g_dc.plans) if (!g_leafCache.count(p.key) && seen.emplace(p.key, 0).second) miss.push_back(&p);
+     }
+     int nmiss = (int)miss.size();
++    g_leafMisses += (uint64_t)nmiss; g_leafHits += g_dc.plans.size() - (size_t)nmiss;
+     if (!miss.empty()) {
++        auto tr0 = std::chrono::steady_clock::now();
++        struct AddMs { std::chrono::steady_clock::time_point t; ~AddMs() { g_leafRasterMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } } addMs{tr0};
+         std::vector<LeafRaster*> out(miss.size());
+         struct Job { int leaf, y0, y1; size_t cost; };
+         std::vector<Job> jobs;
+@@ -751,6 +755,9 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+         }
+         std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.cost > b.cost; });
+         parallelFor((int)jobs.size(), [&](int j) { const Job& jb = jobs[j]; rasterLeafRows(*miss[jb.leaf], out[jb.leaf], jb.y0, jb.y1); });
++        static const int repeat = getenv("ISAAC_LEAF_REPEAT") ? atoi(getenv("ISAAC_LEAF_REPEAT")) : 0;   // (profiling: the same work again)
++        for (int k = 0; k < repeat; k++)
++            for (const Job& jb : jobs) { LeafRaster tmp; const LeafPlan& p = *miss[jb.leaf]; tmp.w = p.w; tmp.h = p.h; tmp.px.assign((size_t)p.w * p.h, 0); rasterLeafRows(p, &tmp, jb.y0, jb.y1); }
+         for (size_t i = 0; i < miss.size(); i++) { out[i]->lastUse = g_leafSeq; g_leafBytes += out[i]->px.size() * 4; g_leafCache[miss[i]->key] = out[i]; }
+     }
+     uint64_t t1 = prof ? SDL_GetPerformanceCounter() : 0;
+@@ -775,6 +782,17 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+     g_dc = DrawCtx();
+ }
+ 
++// (diagnostics) the raster caches' sizes: decoded bitmap surfaces, morph shapes made (count, bytes), leaves (count, bytes)
++void rasterMemNumbers(size_t* bmBytes, size_t* morphs, size_t* morphBytes, size_t* leaves, size_t* leafBytes) {
++    size_t bm = 0; for (auto& kv : g_bmSurf) bm += (size_t)plutovg_surface_get_width(kv.second.s) * plutovg_surface_get_height(kv.second.s) * 4;
++    size_t mor = 0;
++    for (auto& kv : g_morphCache) for (auto& L : kv.second->layers) {
++        for (auto& P : L.fillPaths) mor += P.pts.capacity() * 4 + P.verbs.capacity();
++        for (auto& P : L.linePaths) mor += P.pts.capacity() * 4 + P.verbs.capacity();
++        mor += L.fills.capacity() * sizeof(FillStyle) + L.lines.capacity() * sizeof(LineStyle);
++    }
++    *bmBytes = bm; *morphs = g_morphCache.size(); *morphBytes = mor; *leaves = g_leafCache.size(); *leafBytes = g_leafBytes;
++}
+ void rasterMemStats() {
+     size_t bm = 0; for (auto& kv : g_bmSurf) bm += (size_t)plutovg_surface_get_width(kv.second.s) * plutovg_surface_get_height(kv.second.s) * 4;
+     size_t mor = 0; for (auto& kv : g_morphCache) for (auto& L : kv.second->layers) for (auto& P : L.fillPaths) mor += P.pts.size() * 4 + P.verbs.size();
+diff --git a/rt/swfdata.h b/rt/swfdata.h
+index 07e701b..f0ff2bc 100644
+--- a/rt/swfdata.h
++++ b/rt/swfdata.h
+@@ -97,10 +97,12 @@ struct ShapeDef : CharDef {
+     // again to save memory; raw points at the DefineShape body (after the id) in the movie data
+     const uint8_t* raw = nullptr; uint32_t rawLen = 0; uint16_t rawTag = 0; uint32_t rawOff = 0;   // (raw null: rawLen bytes at rawOff in the SWF cache file)
+     bool parsed = true, pinned = false; uint32_t lastUse = 0; uint32_t parsedBytes = 0;
++    bool hitParsed = true;   // hitEdges made (lean loading: only when a hit test needs them, shapeEnsureHit)
+ };
+ // lean loading: parses the shape's records if they aren't in memory (no-op otherwise). Call before using
+-// layers / hitEdges / hitPolys.
++// layers / hitPolys; before hitEdges, shapeEnsureHit.
+ void shapeEnsure(ShapeDef* s);
++void shapeEnsureHit(ShapeDef* s);
+ extern bool g_leanSwf;
+ 
+ // ---- Morph: paired edges
+@@ -175,7 +177,9 @@ struct SpriteDef : CharDef {
+     std::unordered_map<std::string, int> labels;   // label → frame (1-based)
+     std::unique_ptr<StreamInfo> stream;
+     Str* exportName = nullptr;
+-    const uint8_t* tlData = nullptr; size_t tlBeg = 0, tlEnd = 0;   // lean loading: timeline not parsed yet (spriteEnsure)
++    const uint8_t* tlData = nullptr; size_t tlBeg = 0, tlEnd = 0;   // lean loading: the timeline's tags, parsed when needed (spriteEnsure)
++    bool tlParsed = false;   // (lean loading) frames / places / labels parsed from tlData
++    uint32_t instances = 0, lastUse = 0, tlBytes = 0;   // clips of this sprite alive; last tick one was made; parsed size
+ };
+ void spriteEnsure(SpriteDef* sp);   // parses a lean-loaded sprite's timeline (first instance)
+ 
+diff --git a/rt/swfload.cpp b/rt/swfload.cpp
+index 4e19ea2..2f46fa9 100644
+--- a/rt/swfload.cpp
++++ b/rt/swfload.cpp
+@@ -165,13 +165,19 @@ inline uint64_t ptKey(int32_t x, int32_t y) { return (uint64_t)(uint32_t)x << 32
+ 
+ void buildFillPaths(std::vector<std::vector<Edge>>& perFill, std::vector<Path>& out) {
+     out.resize(perFill.size());
++    // edges by start point: sorted (start, index) pairs, one allocation (a hash multimap made one per edge, which on
++    // the FunKey was much of a shape's parsing); among edges starting at the same point the lowest index comes first
++    std::vector<std::pair<uint64_t, uint32_t>> byStart; std::vector<uint8_t> used;
+     for (size_t fi = 0; fi < perFill.size(); fi++) {
+         auto& edges = perFill[fi];
+         if (edges.empty()) continue;
+         Path& path = out[fi];
+-        std::unordered_multimap<uint64_t, uint32_t> byStart; byStart.reserve(edges.size() * 2);
+-        for (uint32_t i = 0; i < edges.size(); i++) byStart.emplace(ptKey(edges[i].x0, edges[i].y0), i);
+-        std::vector<uint8_t> used(edges.size(), 0);
++        byStart.resize(edges.size());
++        for (uint32_t i = 0; i < edges.size(); i++) byStart[i] = {ptKey(edges[i].x0, edges[i].y0), i};
++        std::sort(byStart.begin(), byStart.end());
++        used.assign(edges.size(), 0);
++        size_t curves = 0; for (auto& e : edges) curves += e.curve;
++        path.verbs.reserve(edges.size() + 8); path.pts.reserve(2 * edges.size() + 2 * curves + 16);
+         for (uint32_t i = 0; i < edges.size(); i++) {
+             if (used[i]) continue;
+             int32_t sx = edges[i].x0, sy = edges[i].y0;
+@@ -183,9 +189,10 @@ void buildFillPaths(std::vector<std::vector<Edge>>& perFill, std::vector<Path>&
+                 if (e.curve) { path.verbs.push_back(2); path.pts.insert(path.pts.end(), {e.cx / 20.f, e.cy / 20.f, e.x1 / 20.f, e.y1 / 20.f}); }
+                 else { path.verbs.push_back(1); path.pts.insert(path.pts.end(), {e.x1 / 20.f, e.y1 / 20.f}); }
+                 if (e.x1 == sx && e.y1 == sy) break;
+-                auto range = byStart.equal_range(ptKey(e.x1, e.y1));
++                const uint64_t k = ptKey(e.x1, e.y1);
+                 int64_t next = -1;
+-                for (auto it = range.first; it != range.second; ++it) if (!used[it->second]) { next = it->second; break; }
++                for (auto it = std::lower_bound(byStart.begin(), byStart.end(), std::make_pair(k, (uint32_t)0)); it != byStart.end() && it->first == k; ++it)
++                    if (!used[it->second]) { next = it->second; break; }
+                 if (next < 0) break;
+                 cur = (uint32_t)next;
+             }
+@@ -277,7 +284,7 @@ void flatten(const Path& p, std::vector<float>& out) {
+ ShapeDef* parseShape(Rd& r, int tag) {
+     auto* s = new ShapeDef(); s->type = CH_SHAPE; s->id = r.u16();
+     if (g_leanSwf) {   // records parsed on demand (shapeEnsure); only the bounds now
+-        s->rawTag = (uint16_t)tag; s->parsed = false;
++        s->rawTag = (uint16_t)tag; s->parsed = false; s->hitParsed = false;
+         s->bounds = r.rect();
+         s->raw = nullptr; s->rawOff = r.u32(); s->rawLen = r.u32();   // stub (leanTags): the records stay in the cache file
+         return s;
+@@ -310,7 +317,7 @@ static size_t shapeBytes(const ShapeDef* s) {
+ }
+ static void shapeDrop(ShapeDef* s) {
+     std::vector<ShapeLayer>().swap(s->layers); std::vector<HitEdge>().swap(s->hitEdges);
+-    std::vector<std::vector<float>>().swap(s->hitPolys); s->hitBuilt = false; s->parsed = false;
++    std::vector<std::vector<float>>().swap(s->hitPolys); s->hitBuilt = false; s->parsed = false; s->hitParsed = false;
+     g_shapeParsedBytes -= std::min<size_t>(g_shapeParsedBytes, s->parsedBytes); s->parsedBytes = 0;
+ }
+ bool g_shapeEvict = false;   // drop parsed shapes over the budget: only with a single thread using them (PSP)
+@@ -335,7 +342,16 @@ void shapeEnsure(ShapeDef* s) {
+     s->layers.emplace_back();
+     readFillStyles(r, tag, s->layers.back().fills); readLineStyles(r, tag, s->layers.back().lines);
+     r.align(); int fb = r.ub(4), lb = r.ub(4);
+-    readShapeRecords(r, tag, s->layers, fb, lb, &s->hitEdges);
++    // the paths only: the edges for exact hit tests (as many bytes again) when a hit test needs them (shapeEnsureHit),
++    // and every vector at its size, so that the budget holds about twice as many shapes (fewer parsed again)
++    readShapeRecords(r, tag, s->layers, fb, lb, nullptr);
++    for (auto& L : s->layers) {
++        for (auto& P : L.fillPaths) { P.pts.shrink_to_fit(); P.verbs.shrink_to_fit(); }
++        for (auto& P : L.linePaths) { P.pts.shrink_to_fit(); P.verbs.shrink_to_fit(); }
++        L.fills.shrink_to_fit(); L.lines.shrink_to_fit(); L.fillPaths.shrink_to_fit(); L.linePaths.shrink_to_fit();
++    }
++    s->layers.shrink_to_fit();
++    s->hitParsed = false;
+     s->parsedBytes = (uint32_t)shapeBytes(s);
+     std::atomic_thread_fence(std::memory_order_release);
+     s->parsed = true;
+@@ -353,6 +369,32 @@ void shapeEnsure(ShapeDef* s) {
+         g_shapeParsedList.resize(w);
+     }
+ }
++// the edges for exact hit tests (hitShape): read again from the records, the paths left as they are (the renderer
++// may be using them)
++uint32_t g_shapeHitParses = 0;   // (diagnostics)
++void shapeEnsureHit(ShapeDef* s) {
++    if (!s) return;
++    shapeEnsure(s);
++    if (s->hitParsed) return;
++    std::lock_guard<std::mutex> lk(g_shapeMu);
++    if (s->hitParsed) return;
++    auto tp0 = std::chrono::steady_clock::now();
++    struct AddMs { std::chrono::steady_clock::time_point t; ~AddMs() { extern double g_lazyParseMs; g_lazyParseMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } } addMs{tp0};
++    std::vector<uint8_t> buf;
++    if (!s->raw && !leanRead(s->rawOff, s->rawLen, buf)) { s->hitParsed = true; return; }
++    Rd r(s->raw ? s->raw : buf.data(), 0, s->rawLen); int tag = s->rawTag;
++    r.rect();
++    if (tag == 83) { r.rect(); r.u8(); }
++    std::vector<ShapeLayer> paths(1);
++    readFillStyles(r, tag, paths.back().fills); readLineStyles(r, tag, paths.back().lines);
++    r.align(); int fb = r.ub(4), lb = r.ub(4);
++    readShapeRecords(r, tag, paths, fb, lb, &s->hitEdges);
++    s->hitEdges.shrink_to_fit();
++    size_t add = sizeof(HitEdge) * s->hitEdges.capacity();
++    s->parsedBytes += (uint32_t)add; g_shapeParsedBytes += add;
++    s->hitParsed = true;
++    g_shapeHitParses++;
++}
+ namespace {
+ MorphDef* parseMorph(Rd& r, int tag, size_t end) {
+     auto* m = new MorphDef(); m->type = CH_MORPH; m->id = r.u16();
+@@ -746,12 +788,46 @@ void parseTimeline(const uint8_t* d, size_t p, size_t end, SpriteDef* sp, bool i
+ }
+ }  // namespace
+ double g_lazyParseMs = 0;   // (diagnostics) time parsing timelines and shapes on demand
++// Lean loading: a sprite's timeline (frames, placements, labels) is parsed when its first clip is made. Kept for good,
++// those grew without limit in a long session (each new kind of enemy, effect or item seen: about 10 MB after eight
++// floors, the main part of the memory that crept up); with a budget (g_timelineBudgetBytes, the FunKey's), the
++// timelines of sprites that have no clip any more and made none in the last 2 seconds are dropped, least recently
++// used first, and parsed again from the same tags when needed (the same commands: names are interned for good and the
++// scripts are looked up by sprite and frame). Sprites with a sound stream are kept (a sound channel may point at it).
++size_t g_timelineBytes = 0, g_timelines = 0, g_timelineDrops = 0;   // (diagnostics) parsed now (bytes), parses, drops
++size_t g_timelineBudgetBytes = 0;   // 0: never dropped
++static std::vector<SpriteDef*> g_timelineList;
++static size_t timelineBytes(const SpriteDef* sp) {
++    size_t b = sp->frames.capacity() * sizeof(sp->frames[0]) + sp->places.capacity() * sizeof(PlaceCmd) + sp->labels.size() * 48;
++    for (auto& f : sp->frames) b += f.capacity() * sizeof(FrameCmd);
++    return b;
++}
++static void timelineDrop(SpriteDef* sp) {
++    std::vector<std::vector<FrameCmd>>().swap(sp->frames); std::vector<PlaceCmd>().swap(sp->places);
++    std::unordered_map<std::string, int>().swap(sp->labels);
++    g_timelineBytes -= std::min<size_t>(g_timelineBytes, sp->tlBytes); sp->tlBytes = 0; sp->tlParsed = false;
++    g_timelineDrops++;
++}
+ void spriteEnsure(SpriteDef* sp) {
+-    if (!sp->tlData) return;
++    if (!sp->tlData) return;   // (parsed with the movie)
++    sp->lastUse = g_shapeTick;
++    if (sp->tlParsed) return;
+     auto t0 = std::chrono::steady_clock::now();
+-    const uint8_t* d = sp->tlData; sp->tlData = nullptr;
+-    parseTimeline(d, sp->tlBeg, sp->tlEnd, sp, false);
++    parseTimeline(sp->tlData, sp->tlBeg, sp->tlEnd, sp, false);
++    sp->tlParsed = true;
+     g_lazyParseMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    sp->tlBytes = (uint32_t)timelineBytes(sp); g_timelineBytes += sp->tlBytes; g_timelines++;
++    g_timelineList.push_back(sp);
++    if (g_timelineBudgetBytes && g_timelineBytes > g_timelineBudgetBytes) {   // down to 3/4 of the budget
++        std::sort(g_timelineList.begin(), g_timelineList.end(), [](SpriteDef* a, SpriteDef* b) { return a->lastUse < b->lastUse; });
++        size_t target = g_timelineBudgetBytes * 3 / 4, w = 0;
++        for (size_t i = 0; i < g_timelineList.size(); i++) {
++            SpriteDef* x = g_timelineList[i];
++            if (g_timelineBytes > target && x != sp && x->tlParsed && !x->instances && !x->stream && x->lastUse + 60 < g_shapeTick) timelineDrop(x);
++            else if (x->tlParsed) g_timelineList[w++] = x;
++        }
++        g_timelineList.resize(w);
++    }
+ }
+ namespace {
+ // The Steam game doesn't ship a standalone .swf: Isaac.exe is an MDM Zinc projector that carries the SWF (CWS) at the end
+@@ -978,10 +1054,16 @@ static bool leanTags(FILE* f, size_t pos, size_t end, std::vector<uint8_t>& out)
+     return true;
+ }
+ #endif
++double g_leanReadMs = 0; uint64_t g_leanReads = 0, g_leanReadBytes = 0;   // (diagnostics) reads of shapes from the game file
+ static bool leanRead(uint32_t off, uint32_t len, std::vector<uint8_t>& out) {
+     std::lock_guard<std::mutex> lk(g_swfFileMu);
++    auto t0 = std::chrono::steady_clock::now();
+     out.resize(len);
+     if (!g_swfFile || fseek(g_swfFile, (long)off, SEEK_SET) != 0 || fread(out.data(), 1, len, g_swfFile) != len) { logf("game data: read error\n"); return false; }
++    g_leanReadMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    g_leanReads++; g_leanReadBytes += len;
++    static const bool log = getenv("ISAAC_LEANREAD_LOG") != nullptr;   // (testing) where in the file
++    if (log) logf("[leanread] %u %u %u\n", g_shapeTick, off, len);
+     return true;
+ }
+ static std::map<const void*, std::weak_ptr<const std::vector<uint8_t>>> g_soundCacheW;

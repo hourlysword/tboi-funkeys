@@ -1,0 +1,1024 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Fri, 30 Oct 2026 20:03:55 -0400
+Subject: [PATCH] Software renderer for the FunKey S (no GPU), and headless
+ screenshots from it
+
+rt/render_soft.cpp implements render.h on the CPU and replaces render.cpp in ISAAC_FUNKEY builds (it builds on PC
+too). Modelled on the PSP's renderer: one thread, the frame drawn right after the tick that built the snapshot.
+- The scene is drawn at the stage's own resolution (363x272 with genpsp/) and scaled once to the output (area
+  averaging; vertical pass first, with NEON on ARM): 240x180 in the middle of the FunKey's 240x240 screen, or the
+  whole screen (g_softStretch). The game's layers and most sprites are then copied 1:1, not resampled.
+- Shapes, texts and morphs rasterized with raster.cpp at the scale they're shown at (1/32-octave keys, an 8 MB cache,
+  least recently used dropped); drawn 1:1 (mirroring included) when the transform allows, else resampled (bilinear).
+- Each graphic's rows indexed once into runs (opaque stretches copied, the rest blended, gaps skipped): a room is a
+  dozen stage-sized, mostly transparent layers. BitmapData runs follow BitmapData::version (SnapNode::bmVersion).
+- Large graphics stretched or turned but still (same transform as the previous frame), and graphics far bigger than
+  the stage, are rasterized at their transform where they show (raster.cpp: rasterizeSrcAt) and copied 1:1.
+- BitmapData drawn from their own pixels (SnapNode::bmPx, as on the PSP; snapshot.cpp copies nothing for them).
+- Colour transforms per pixel as render.cpp's shader computes them; masks with an 8-bit stencil.
+- Not done, as on the PSP: blur filters, interpolation, preloading, the focus "ink" (a frame instead).
+- Diagnostics text, the version picker and the loading screen drawn on the output with the 5x7 font.
+
+main.cpp: in a FunKey build, headless mode renders without a window or SDL video (--headless --size WxH; "shot"
+writes PPM or BMP), and "OFKMEM dbegin" / "OFKMEM draw" lines bracket each frame for qemu's armprof.
+Testing hooks: ISAAC_SOFT_CACHE_KB, ISAAC_SOFT_STRETCH, ISAAC_SOFT_RASTERLOG, ISAAC_SOFT_DRAWLOG=<tick>.
+
+Checked: screenshots against render.cpp (Mesa, same ticks, layers on the CPU): rooms within about 1 level in 255 per
+channel, menus 2.5-4.5 (no blurred shadows). Under qemu, drawing a floor 1 room is 5.0 M ARM instructions per frame
+(median), floor 2 6.2 M; the logic still plays the same as the PC reference (every enemy's state at every tick).
+---
+ CMakeLists.txt     |   6 +-
+ rt/main.cpp        |  23 +-
+ rt/raster.cpp      |  13 +
+ rt/raster.h        |   3 +
+ rt/render_soft.cpp | 792 +++++++++++++++++++++++++++++++++++++++++++++
+ rt/snapshot.cpp    |  11 +-
+ rt/snapshot.h      |   3 +-
+ 7 files changed, 844 insertions(+), 7 deletions(-)
+ create mode 100644 rt/render_soft.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1731fb7..9ba62b0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -158,6 +158,10 @@ if(PSP)   # own main loop and sceGu renderer
+   list(REMOVE_ITEM RT_SRC rt/render.cpp rt/main.cpp rt/touch.cpp)
+   list(APPEND RT_SRC rt/render_psp.cpp rt/main_psp.cpp)
+ endif()
++if(ISAAC_FUNKEY)   # no GPU: the software renderer (it builds on PC too, for testing)
++  list(REMOVE_ITEM RT_SRC rt/render.cpp)
++  list(APPEND RT_SRC rt/render_soft.cpp)
++endif()
+ # lean SWF loading (PSP; on PC for testing): the SWF is decompressed to a cache file, sounds read from it on demand,
+ # shapes parsed when first drawn
+ option(ISAAC_LEAN "Lean SWF loading (PSP memory budget)" OFF)
+@@ -241,7 +245,7 @@ elseif(NINTENDO_SWITCH)
+     COMMAND ${DEVKITPRO}/tools/bin/nacptool --create "${APP_TITLE}" "${APP_AUTHOR}" "${APP_VERSION}" isaac.nacp
+     COMMAND ${DEVKITPRO}/tools/bin/elf2nro $<TARGET_FILE:isaac> isaac.nro --icon=${CMAKE_SOURCE_DIR}/switch/icon.jpg --nacp=isaac.nacp
+     COMMENT "Generating isaac.nro")
+-elseif(ISAAC_FUNKEY)
++elseif(ISAAC_FUNKEY AND CMAKE_CROSSCOMPILING)
+   target_link_libraries(isaac PRIVATE SDL2::SDL2-static)   # (the FunKey sysroot has SDL2 as a static library only)
+ elseif(TARGET SDL2::SDL2)
+   if(TARGET SDL2::SDL2main)
+diff --git a/rt/main.cpp b/rt/main.cpp
+index 019006d..0cfca62 100644
+--- a/rt/main.cpp
++++ b/rt/main.cpp
+@@ -647,6 +647,9 @@ int main(int argc, char** argv) {
+     Uint32 sdlFlags = SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER;
+ #endif
+     if (headless && norender) sdlFlags = SDL_INIT_TIMER | SDL_INIT_AUDIO;
++#ifdef ISAAC_FUNKEY
++    if (headless) sdlFlags = SDL_INIT_TIMER | SDL_INIT_AUDIO;   // (the software renderer needs no window: nor SDL's video)
++#endif
+     if (getenv("ISAAC_TOUCH")) cfg.touchControls = true;   // (testing on PC)
+     if (cfg.touchControls) SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");   // touches are handled as such, not as a mouse
+ #ifdef __ANDROID__
+@@ -689,6 +692,11 @@ int main(int argc, char** argv) {
+     if (cfg.fullscreen) wflags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+ #endif
+     SDL_Window* win = nullptr; SDL_GLContext gl = nullptr;
++#ifdef ISAAC_FUNKEY
++    if (headless && !norender) {   // (the software renderer: no window and no OpenGL; frames of --size, screenshots from them)
++        if (!renderInit()) return 1;
++    } else
++#endif
+     if (!(headless && norender)) {   // (logic tests need neither a window nor a GPU)
+         win = SDL_CreateWindow("The Binding of Isaac", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, cfg.width, cfg.height, wflags);
+         if (win) { int w0, h0; SDL_GetWindowSize(win, &w0, &h0); if (h0 > 0) fl::g_windowAspect = (float)w0 / h0; }
+@@ -839,12 +847,14 @@ int main(int argc, char** argv) {
+ 
+     if (headless) {
+         // ---------------------------------------------------------------- test mode: deterministic, single thread
++        // (the frame's size: the window's; without one, the software renderer's frame of --size)
++        auto drawable = [&](int& w, int& h) { if (win) SDL_GL_GetDrawableSize(win, &w, &h); else { w = cfg.width; h = cfg.height; } };
+         while (running && !g_player.quit) {
+             SDL_Event e; while (SDL_PollEvent(&e)) if (e.type == SDL_QUIT) running = false;
+             g_player.timeMs = g_player.tick * 1000.0 / g_frameRate;   // (exact: n * 1000 / 30, like the Ruffle harness)
+             runScript([&](double fr, const std::string& file) {
+                 if (norender) return;
+-                int dw, dh; SDL_GL_GetDrawableSize(win, &dw, &dh); renderFrame(dw, dh, fr);
++                int dw, dh; drawable(dw, dh); renderFrame(dw, dh, fr);
+                 if (perfOn) renderOverlay(perfLines);
+                 renderEndFrame();
+                 renderScreenshot(file.c_str());
+@@ -898,8 +908,11 @@ int main(int argc, char** argv) {
+             SnapPtr snap = buildSnapshot(); snap->time = g_player.tick * dt;
+             if (menuUi) menuUiFill(*snap);
+             renderAdopt(snap);
+-            int dw, dh; SDL_GL_GetDrawableSize(win, &dw, &dh);
+-            Uint64 rt0 = SDL_GetPerformanceCounter();
++            int dw, dh; drawable(dw, dh);
++            // (testing) "OFKMEM dbegin" / "OFKMEM draw" bracket drawing the frame and finishing it (the software renderer:
++            // scaling it to the output), as "begin" / "tick" do the logic
++            if (tickMarks) logf("OFKMEM dbegin %u\n", g_player.tick);
++            Uint64 rt0 = SDL_GetPerformanceCounter(); double rcpu0 = threadCpuMs();
+             renderFrame(dw, dh, g_benchAlpha);
+             static const bool gpuTime = getenv("ISAAC_GLFINISH") != nullptr;   // (testing: render time includes the GPU's)
+             if (gpuTime) { renderEndFrame(); renderFinish(); }
+@@ -907,6 +920,7 @@ int main(int argc, char** argv) {
+             if (perfOn) renderOverlay(perfLines);
+             renderEndFrame();
+             double ovms = (SDL_GetPerformanceCounter() - rt0) * 1000.0 / freq - rms;
++            if (tickMarks) logf("OFKMEM draw %u ms %.3f cpu %.3f rasters %d quads %d\n", g_player.tick, rms + ovms, threadCpuMs() - rcpu0, g_rstats.rasters, g_rstats.quads);
+             if (stats) {
+                 renderMs.push_back(rms);
+                 static double sA, sC, sP, sE, sO; static int sN, sNodes, sCmds, sQuads, sDraws, sF, sFH; static long totRasters = 0;
+@@ -922,7 +936,8 @@ int main(int argc, char** argv) {
+                 if (rms > 20) logf("[stats] slow render tick %u: %.1f ms (rasterized %d in %.1f ms, upload %.1f MB, %d quads, %d draws, %d filters, %d new textures)\n",
+                                    g_player.tick, rms, g_rstats.rasters, g_rstats.rasterMs, g_rstats.uploadMB, g_rstats.quads, g_rstats.draws, g_rstats.filters, g_rstats.texCreates);
+             }
+-            SDL_GL_SwapWindow(win); renderedFrames++;
++            if (win) SDL_GL_SwapWindow(win);
++            renderedFrames++;
+         }
+     } else {
+         // ---------------------------------------------------------------- normal mode
+diff --git a/rt/raster.cpp b/rt/raster.cpp
+index 3e33d10..678d267 100644
+--- a/rt/raster.cpp
++++ b/rt/raster.cpp
+@@ -368,6 +368,19 @@ bool rasterizeSrc(const RasterSrc& src, double scale, Raster& out) {
+     plutovg_canvas_destroy(cv); plutovg_surface_destroy(s);
+     return true;
+ }
++bool rasterizeSrcAt(const RasterSrc& src, const Mat& m, int x0, int y0, int w, int h, Raster& out) {
++    if (w <= 0 || h <= 0 || !src.def) return false;
++    out.w = w; out.h = h; out.x0 = x0; out.y0 = y0; out.scale = 1;
++    out.px.assign((size_t)w * h, 0);
++    plutovg_surface_t* s = plutovg_surface_create_for_data((unsigned char*)out.px.data(), w, h, w * 4);
++    plutovg_canvas_t* cv = plutovg_canvas_create(s);
++    Mat t = m; t.tx -= x0; t.ty -= y0;
++    g_frontToBack = src.kind == OK_SHAPE || src.kind == OK_MORPH;
++    paintContentSrc(cv, src, t, nullptr);
++    g_frontToBack = false;
++    plutovg_canvas_destroy(cv); plutovg_surface_destroy(s);
++    return true;
++}
+ bool rasterize(DisplayObject* d, double scale, Raster& out) { return rasterizeSrc(rasterSrcOf(d), scale, out); }
+ 
+ // ============================================================ raster threads
+diff --git a/rt/raster.h b/rt/raster.h
+index ab1b03e..6103c3c 100644
+--- a/rt/raster.h
++++ b/rt/raster.h
+@@ -12,6 +12,9 @@ bool contentBoundsSrc(const RasterSrc& s, RectF& b);
+ struct Raster { std::vector<uint32_t> px; int w = 0, h = 0; double x0 = 0, y0 = 0, scale = 1; };
+ bool rasterize(DisplayObject* d, double scale, Raster& out);
+ bool rasterizeSrc(const RasterSrc& s, double scale, Raster& out);
++// only the window (x0, y0)-(x0 + w, y0 + h) of the content drawn with the matrix m (render_soft.cpp: graphics far
++// bigger than the screen, of which a part shows); out.x0 / y0 = x0 / y0, out.scale = 1
++bool rasterizeSrcAt(const RasterSrc& s, const Mat& m, int x0, int y0, int w, int h, Raster& out);
+ bool contentBounds(DisplayObject* d, RectF& b);
+ void bitmapDraw(BitmapData* bd, Object* src, const Mat& m, const CX* cx);
+ ShapeDef* morphShape(const MorphDef* md, uint16_t ratio);
+diff --git a/rt/render_soft.cpp b/rt/render_soft.cpp
+new file mode 100644
+index 0000000..c1edf5b
+--- /dev/null
++++ b/rt/render_soft.cpp
+@@ -0,0 +1,792 @@
++// SPDX-License-Identifier: MIT
++// Software renderer (FunKey S: one Cortex-A7 core, no GPU). Same interface as render.cpp (OpenGL) and render_psp.cpp
++// (the PSP's GE), built like the PSP's: one thread, the frame drawn right after the logic tick that built the snapshot.
++// - The scene is drawn at the stage's own resolution (g_stageW x g_stageH: 363x272 with genpsp/), in stage pixels. The
++//   game's layers (floor, creep, blood: BitmapData of the stage's size) and most sprites are then copied 1:1 rather
++//   than resampled. The finished frame is scaled once to the output (renderEndFrame): 240x180 in the middle of the
++//   FunKey's 240x240 screen, or the whole screen (renderSoftStretch).
++// - Vector graphics are rasterized on the CPU (raster.cpp / PlutoVG) at the scale they are shown at and kept, the least
++//   recently used dropped beyond a memory budget. Drawn 1:1 when the transform is a translation (mirroring included);
++//   otherwise resampled (bilinear) through the inverse transform.
++// - BitmapData layers are drawn from the game's own pixels (SnapNode::bmPx: one thread, valid until the next tick).
++// - Colour transforms per pixel, as render.cpp's shader computes them.
++// - Masks with an 8-bit stencil, as on the PSP: mask pixels with alpha >= 0.5 count.
++// - No blur filters, no interpolation (one frame per tick), no preloading, no GPU layers (all BitmapData on the CPU).
++// - Diagnostics text (overlay, version picker, loading screen) is drawn on the output, at its resolution.
++#include "render.h"
++#include "raster.h"
++#include "core.h"
++#include <chrono>
++#include <cctype>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <algorithm>
++#include <unordered_map>
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
++
++namespace fl {
++RenderConfig g_renderCfg;
++RenderStats g_rstats;
++Mat g_stageToWindow;
++bool g_glES = false;
++bool g_retireSnapshots = false;
++bool g_softStretch = false;   // the output fills the whole window (FunKey: 240x240) instead of keeping the stage's shape
++
++namespace {
++using Clock = std::chrono::steady_clock;
++double msSince(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
++
++// ---------------------------------------------------------------- frame buffers
++int g_cw = 0, g_ch = 0;                 // the canvas: the stage, 1:1
++std::vector<uint32_t> g_canvas;         // premultiplied ARGB (0xAARRGGBB), opaque once the background is in
++std::vector<uint8_t> g_stencil;         // mask nesting per pixel (0 outside every mask)
++bool g_stencilUsed = false;
++int g_level = 0;                        // nesting of the masks being drawn into
++int g_winW = 0, g_winH = 0;             // the output (window, or the FunKey's screen)
++std::vector<uint32_t> g_win;            // the output frame (ARGB, opaque)
++std::vector<uint32_t> g_tmp;            // (scaling: the canvas resampled horizontally)
++SnapPtr g_cur;
++uint32_t g_frameNo = 0;
++bool g_sceneDrawn = false;              // this frame has a scene (otherwise: a plain screen with text)
++uint32_t g_clearArgb = 0xff000000u;
++
++// text and outlines drawn on the output after scaling (window pixels)
++struct TextItem { std::vector<std::string> lines; float x, y; int px; uint32_t ink, paper; };
++std::vector<TextItem> g_texts;
++bool g_focusOn = false, g_focusStrong = false; float g_focus[4] = {};
++
++// ---------------------------------------------------------------- matrices (float: the renderer needs no more)
++struct FMat {
++    float a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;
++    FMat() {}
++    explicit FMat(const Mat& m) : a((float)m.a), b((float)m.b), c((float)m.c), d((float)m.d), tx((float)m.tx), ty((float)m.ty) {}
++    FMat(float a_, float b_, float c_, float d_, float tx_, float ty_) : a(a_), b(b_), c(c_), d(d_), tx(tx_), ty(ty_) {}
++    FMat operator*(const FMat& o) const {   // this ∘ o (o first)
++        return {a * o.a + c * o.b, b * o.a + d * o.b, a * o.c + c * o.d, b * o.c + d * o.d, a * o.tx + c * o.ty + tx, b * o.tx + d * o.ty + ty};
++    }
++    void apply(float x, float y, float& ox, float& oy) const { ox = a * x + c * y + tx; oy = b * x + d * y + ty; }
++    bool invert(FMat& o) const {
++        float det = a * d - b * c; if (std::fabs(det) < 1e-12f) return false;
++        float id = 1 / det;
++        o.a = d * id; o.b = -b * id; o.c = -c * id; o.d = a * id;
++        o.tx = -(o.a * tx + o.c * ty); o.ty = -(o.b * tx + o.d * ty);
++        return true;
++    }
++};
++float maxScale(const FMat& m) { return std::sqrt(std::max(m.a * m.a + m.b * m.b, m.c * m.c + m.d * m.d)); }
++
++// ---------------------------------------------------------------- colour transforms (render.cpp's shader, per pixel)
++struct PixCx {
++    int kind = 0;                      // 0 none, 1 multiply only (integer), 2 general (float)
++    uint32_t mr = 256, mg = 256, mb = 256, ma = 256;
++    float rm = 1, gm = 1, bm = 1, am = 1, ra = 0, ga = 0, ba = 0, aa = 0;
++};
++PixCx pixCx(const CX& cx) {
++    PixCx p;
++    if (cx.identity()) return p;
++    float am = std::max(0.f, std::min(1.f, cx.am));
++    if (cx.ra == 0 && cx.ga == 0 && cx.ba == 0 && cx.aa == 0 && cx.rm <= 1 && cx.gm <= 1 && cx.bm <= 1) {
++        // (premultiplied: colour times its multiplier, everything times the alpha's)
++        auto q = [](float v) { int i = (int)std::lround(std::max(0.f, v) * 256.f); return (uint32_t)std::min(256, i); };
++        p.kind = 1; p.mr = q(cx.rm * am); p.mg = q(cx.gm * am); p.mb = q(cx.bm * am); p.ma = q(am);
++        return p;
++    }
++    p.kind = 2; p.rm = cx.rm; p.gm = cx.gm; p.bm = cx.bm; p.am = cx.am;
++    p.ra = cx.ra / 255.f; p.ga = cx.ga / 255.f; p.ba = cx.ba / 255.f; p.aa = cx.aa / 255.f;
++    return p;
++}
++inline uint32_t applyCx(uint32_t s, const PixCx& c) {
++    if (c.kind == 1) {
++        uint32_t a = ((s >> 24) * c.ma + 128) >> 8, r = (((s >> 16) & 255) * c.mr + 128) >> 8;
++        uint32_t g = (((s >> 8) & 255) * c.mg + 128) >> 8, b = ((s & 255) * c.mb + 128) >> 8;
++        return a << 24 | r << 16 | g << 8 | b;
++    }
++    float a = (s >> 24) / 255.f;
++    if (a <= 0) return 0;   // (a transparent pixel stays transparent: its alpha offset is scaled by its coverage)
++    auto cl = [](float v) { return v < 0 ? 0.f : v > 1 ? 1.f : v; };
++    float r = cl(((s >> 16) & 255) / 255.f / a * c.rm + c.ra), g = cl(((s >> 8) & 255) / 255.f / a * c.gm + c.ga);
++    float b = cl((s & 255) / 255.f / a * c.bm + c.ba);
++    float na = cl(a * c.am + c.aa * a);
++    auto q = [](float v) { return (uint32_t)(v * 255.f + 0.5f); };
++    return q(na) << 24 | q(r * na) << 16 | q(g * na) << 8 | q(b * na);
++}
++
++// premultiplied source over the destination
++inline void blendOver(uint32_t& d, uint32_t s) {
++    uint32_t a = s >> 24;
++    if (a == 255) { d = s; return; }
++    if (!s) return;
++    uint32_t ia = 255 - a;
++    uint32_t rb = (d & 0x00ff00ffu) * ia, ag = ((d >> 8) & 0x00ff00ffu) * ia;
++    rb = ((rb + 0x00800080u + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;   // (x / 255, rounded)
++    ag = ((ag + 0x00800080u + ((ag >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++    d = s + (rb | ag << 8);
++}
++// a + (b - a) * t / 256 on all four channels (t 0..256)
++inline uint32_t lerpPx(uint32_t a, uint32_t b, uint32_t t) {
++    uint32_t it = 256 - t;
++    uint32_t rb = ((a & 0x00ff00ffu) * it + (b & 0x00ff00ffu) * t) >> 8;
++    uint32_t ag = (((a >> 8) & 0x00ff00ffu) * it + ((b >> 8) & 0x00ff00ffu) * t) >> 8;
++    return (rb & 0x00ff00ffu) | (ag & 0x00ff00ffu) << 8;
++}
++
++// ---------------------------------------------------------------- runs: where a texture's rows have pixels
++// A room is a stack of layers the size of the stage (floor, walls, shadows, light, the HUD band...), most of them
++// transparent over most of their area: drawn pixel by pixel, that was a dozen passes over the whole stage every frame.
++// So each row is indexed once into stretches that hold pixels, each either opaque (copied) or not (blended); the
++// transparent gaps between them (4 pixels or more) are skipped. Built when a graphic is rasterized, and for a BitmapData
++// whenever its pixels change (unless they change every frame).
++struct Seg { uint16_t x0, x1; uint8_t opaque; };
++struct Runs { std::vector<uint32_t> row; std::vector<Seg> segs; };   // row: h + 1 offsets into segs
++void buildRuns(const uint32_t* px, int w, int h, int stride, Runs& r) {
++    r.row.assign((size_t)h + 1, 0); r.segs.clear();
++    const uint32_t kOpaque = 0xff000000u;
++    for (int y = 0; y < h; y++) {
++        r.row[y] = (uint32_t)r.segs.size();
++        const uint32_t* p = px + (size_t)y * stride;
++        int x = 0;
++        while (x < w) {
++            while (x < w && !p[x]) x++;
++            if (x >= w) break;
++            int s = x, last = x;
++            while (x < w) { if (p[x]) last = x; else if (x - last >= 4) break; x++; }   // (ends at a gap of 4 or more)
++            int e = last + 1;
++            for (int i = s; i < e;) {   // opaque stretches of 8 or more are copied, the rest blended
++                int j = i; while (j < e && p[j] >= kOpaque) j++;
++                if (j - i >= 8) { r.segs.push_back({(uint16_t)i, (uint16_t)j, 1}); i = j; continue; }
++                int k = i;
++                while (k < e) {
++                    if (p[k] >= kOpaque) { int m = k; while (m < e && p[m] >= kOpaque) m++; if (m - k >= 8) break; k = m; }
++                    else k++;
++                }
++                r.segs.push_back({(uint16_t)i, (uint16_t)k, 0}); i = k;
++            }
++            x = e;
++        }
++    }
++    r.row[h] = (uint32_t)r.segs.size();
++}
++
++// ---------------------------------------------------------------- drawing a texture through an affine transform
++enum Mode { M_DRAW, M_PUSH, M_POP };   // draw colours; or add to / take from the stencil (masks)
++struct Tex { const uint32_t* px; int w, h, stride; const Runs* runs = nullptr; };
++
++// one pixel: colour or stencil
++inline void putPixel(int idx, uint32_t s, const PixCx& cx, Mode mode) {
++    if (mode == M_DRAW) {
++        if (g_level && g_stencil[idx] != g_level) return;
++        if (cx.kind) s = applyCx(s, cx);
++        blendOver(g_canvas[idx], s);
++    } else if ((s >> 24) >= 128) {
++        uint8_t& st = g_stencil[idx];
++        if (mode == M_PUSH) { if (st == g_level) st = (uint8_t)(g_level + 1); }
++        else if (st == g_level + 1) st = (uint8_t)g_level;
++    }
++}
++
++// A: texel space -> canvas (texel (u, v) covers [u, u+1) x [v, v+1)). smooth: bilinear, else the nearest texel.
++void drawTex(const Tex& t, const FMat& A, const CX& cxIn, Mode mode, bool smooth) {
++    if (t.w <= 0 || t.h <= 0 || !t.px) return;
++    // bounds on the canvas
++    float xs[4], ys[4];
++    A.apply(0, 0, xs[0], ys[0]); A.apply((float)t.w, 0, xs[1], ys[1]); A.apply(0, (float)t.h, xs[2], ys[2]); A.apply((float)t.w, (float)t.h, xs[3], ys[3]);
++    float lx = std::min({xs[0], xs[1], xs[2], xs[3]}), hx = std::max({xs[0], xs[1], xs[2], xs[3]});
++    float ly = std::min({ys[0], ys[1], ys[2], ys[3]}), hy = std::max({ys[0], ys[1], ys[2], ys[3]});
++    int bx0 = std::max(0, (int)std::floor(lx)), bx1 = std::min(g_cw, (int)std::ceil(hx));
++    int by0 = std::max(0, (int)std::floor(ly)), by1 = std::min(g_ch, (int)std::ceil(hy));
++    if (bx0 >= bx1 || by0 >= by1) return;
++    PixCx cx = mode == M_DRAW ? pixCx(cxIn) : PixCx();
++    g_rstats.quads++;
++    const float kEps = 1e-3f;
++    bool oneToOne = std::fabs(A.b) < kEps && std::fabs(A.c) < kEps && std::fabs(std::fabs(A.a) - 1) < kEps && std::fabs(std::fabs(A.d) - 1) < kEps;
++    static const long drawLog = getenv("ISAAC_SOFT_DRAWLOG") ? atol(getenv("ISAAC_SOFT_DRAWLOG")) : -1;   // (testing) one tick's draws
++    if (drawLog >= 0 && g_cur && drawLog == (long)g_cur->tick)
++        logf("[draw] %dx%d A=(%.4f %.4f %.4f %.4f %.2f %.2f) %s%s cx %d box %dx%d mode %d\n", t.w, t.h, A.a, A.b, A.c, A.d, A.tx, A.ty,
++             oneToOne ? "1:1" : "resampled", smooth ? "" : " nearest", cx.kind, bx1 - bx0, by1 - by0, (int)mode);
++    if (oneToOne) {
++        // 1:1, possibly mirrored: a copy (the position rounded to the nearest pixel)
++        bool fx = A.a < 0, fy = A.d < 0;
++        int ox = (int)std::lround(A.tx), oy = (int)std::lround(A.ty);
++        int x0 = fx ? ox - t.w : ox, y0 = fy ? oy - t.h : oy;
++        int X0 = std::max(0, x0), X1 = std::min(g_cw, x0 + t.w), Y0 = std::max(0, y0), Y1 = std::min(g_ch, y0 + t.h);
++        bool plain = mode == M_DRAW && !g_level && !cx.kind;   // (the common case: a plain blend)
++        for (int Y = Y0; Y < Y1; Y++) {
++            int v = fy ? oy - 1 - Y : Y - oy;
++            const uint32_t* row = t.px + (size_t)v * t.stride;
++            uint32_t* dst = &g_canvas[(size_t)Y * g_cw];
++            if (t.runs) {   // only the stretches that hold pixels
++                const Seg* sg = t.runs->segs.data() + t.runs->row[v];
++                const Seg* se = t.runs->segs.data() + t.runs->row[v + 1];
++                for (; sg < se; sg++) {
++                    // the stretch's texels [x0, x1) on the canvas: [ox + x0, ox + x1), or mirrored [ox - x1, ox - x0)
++                    int D0 = fx ? ox - sg->x1 : ox + sg->x0, D1 = fx ? ox - sg->x0 : ox + sg->x1;
++                    D0 = std::max(D0, X0); D1 = std::min(D1, X1);
++                    if (D0 >= D1) continue;
++                    if (!fx) {
++                        const uint32_t* s = row + (D0 - ox);
++                        if (plain && sg->opaque) memcpy(dst + D0, s, (size_t)(D1 - D0) * 4);
++                        else if (plain) for (int X = D0; X < D1; X++, s++) blendOver(dst[X], *s);
++                        else for (int X = D0; X < D1; X++, s++) { if (*s) putPixel(Y * g_cw + X, *s, cx, mode); }
++                    } else {
++                        const uint32_t* s = row + (ox - 1 - D0);
++                        if (plain && sg->opaque) for (int X = D0; X < D1; X++, s--) dst[X] = *s;
++                        else if (plain) for (int X = D0; X < D1; X++, s--) blendOver(dst[X], *s);
++                        else for (int X = D0; X < D1; X++, s--) { if (*s) putPixel(Y * g_cw + X, *s, cx, mode); }
++                    }
++                }
++                continue;
++            }
++            if (plain) {
++                if (!fx) { const uint32_t* s = row + (X0 - ox); for (int X = X0; X < X1; X++, s++) { uint32_t p = *s; if (p >= 0xff000000u) dst[X] = p; else if (p) blendOver(dst[X], p); } }
++                else { const uint32_t* s = row + (ox - 1 - X0); for (int X = X0; X < X1; X++, s--) { uint32_t p = *s; if (p >= 0xff000000u) dst[X] = p; else if (p) blendOver(dst[X], p); } }
++                continue;
++            }
++            for (int X = X0; X < X1; X++) {
++                uint32_t p = row[fx ? ox - 1 - X : X - ox];
++                if (p) putPixel(Y * g_cw + X, p, cx, mode);
++            }
++        }
++        return;
++    }
++    // resampled through the inverse transform: canvas pixel centre -> texel space, minus half a texel (texel centres)
++    FMat I; if (!A.invert(I)) return;
++    const int32_t one = 65536;
++    int32_t du = (int32_t)std::lround(I.a * one), dv = (int32_t)std::lround(I.b * one);
++    for (int Y = by0; Y < by1; Y++) {
++        float cxp = bx0 + 0.5f, cyp = Y + 0.5f;
++        float su = I.a * cxp + I.c * cyp + I.tx - 0.5f, sv = I.b * cxp + I.d * cyp + I.ty - 0.5f;
++        // the pixels of this row whose sample touches the texture: -1 <= s < size on both axes
++        float k0 = 0, k1 = (float)(bx1 - bx0);
++        auto clip = [&](float s0, float ds, float lo, float hi) {
++            if (std::fabs(ds) < 1e-9f) { if (s0 < lo || s0 >= hi) k1 = -1; return; }
++            float a = (lo - s0) / ds, b = (hi - s0) / ds;
++            if (a > b) std::swap(a, b);
++            k0 = std::max(k0, std::floor(a)); k1 = std::min(k1, std::ceil(b) + 1);
++        };
++        clip(su, I.a, -1.f, (float)t.w); clip(sv, I.b, -1.f, (float)t.h);
++        if (k1 <= k0) continue;
++        int X0 = bx0 + (int)k0, X1 = std::min(bx1, bx0 + (int)k1);
++        int32_t fu = (int32_t)std::lround((su + I.a * k0) * one), fv = (int32_t)std::lround((sv + I.b * k0) * one);
++        uint32_t* dstRow = &g_canvas[(size_t)Y * g_cw];
++        for (int X = X0; X < X1; X++, fu += du, fv += dv) {
++            uint32_t p;
++            if (smooth) {
++                int iu = fu >> 16, iv = fv >> 16;   // (arithmetic shifts: floor)
++                if (iu < -1 || iv < -1 || iu >= t.w || iv >= t.h) continue;
++                uint32_t wu = ((uint32_t)fu >> 8) & 255, wv = ((uint32_t)fv >> 8) & 255;
++                const uint32_t* r0 = t.px + (size_t)iv * t.stride;
++                bool inU0 = iu >= 0, inU1 = iu + 1 < t.w, inV0 = iv >= 0, inV1 = iv + 1 < t.h;
++                uint32_t p00 = inU0 && inV0 ? r0[iu] : 0, p10 = inU1 && inV0 ? r0[iu + 1] : 0;
++                uint32_t p01 = inU0 && inV1 ? r0[t.stride + iu] : 0, p11 = inU1 && inV1 ? r0[t.stride + iu + 1] : 0;
++                if (!(p00 | p10 | p01 | p11)) continue;
++                p = lerpPx(lerpPx(p00, p10, wu), lerpPx(p01, p11, wu), wv);
++            } else {
++                int iu = (fu + one / 2) >> 16, iv = (fv + one / 2) >> 16;
++                if ((unsigned)iu >= (unsigned)t.w || (unsigned)iv >= (unsigned)t.h) continue;
++                p = t.px[(size_t)iv * t.stride + iu];
++            }
++            if (!p) continue;
++            if (mode == M_DRAW && !g_level && !cx.kind) blendOver(dstRow[X], p);
++            else putPixel(Y * g_cw + X, p, cx, mode);
++        }
++    }
++}
++
++// ---------------------------------------------------------------- rasterized shapes, texts and morphs
++struct Key {
++    const void* def; uint32_t variant; int16_t bucket;
++    bool operator==(const Key& o) const { return def == o.def && variant == o.variant && bucket == o.bucket; }
++};
++struct KeyHash { size_t operator()(const Key& k) const { return std::hash<const void*>()(k.def) ^ (k.variant * 0x9e3779b1u) ^ ((size_t)(uint16_t)k.bucket << 20); } };
++struct Entry { Raster r; Runs runs; uint32_t lastUse = 0; bool empty = false; size_t bytes = 0; };
++size_t runsBytes(const Runs& r) { return r.row.size() * 4 + r.segs.size() * sizeof(Seg); }
++std::unordered_map<Key, Entry, KeyHash> g_cache;
++size_t g_cacheBytes = 0, g_cacheBudget = 4u << 20;
++double g_rasterSpentMs = 0;
++const double kRasterBudgetMs = 10;   // a frame rasterizes at most this much new graphics (the rest the next frames)
++
++void cacheTrim() {
++    if (g_cacheBytes <= g_cacheBudget) return;
++    std::vector<std::pair<uint32_t, Key>> order;
++    for (auto& kv : g_cache) if (kv.second.lastUse != g_frameNo) order.push_back({kv.second.lastUse, kv.first});
++    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++    for (auto& o : order) {
++        if (g_cacheBytes <= g_cacheBudget * 3 / 4) break;
++        auto it = g_cache.find(o.second);
++        g_cacheBytes -= it->second.bytes; g_cache.erase(it);
++    }
++}
++// The scale is keyed in steps of 1/32 octave (about 2%): a graphic shown at a scale it was already rasterized at
++// (within the step) reuses that raster, resampled; the first one is rasterized at its exact scale, so the usual case
++// (shown at the same scale every frame) is drawn 1:1.
++Entry* rasterFor(const SnapNode& n, float scale) {
++    if (n.kind != SN_CONTENT || !n.def) return nullptr;
++    if (!(scale >= 1.f / 64)) scale = 1.f / 64; if (scale > 16) scale = 16;
++    int bucket = (int)std::lround(std::log2(scale) * 32.f);
++    uint32_t variant = n.objKind == OK_EDITTEXT ? n.textVersion : n.objKind == OK_MORPH ? (uint32_t)(n.ratio & 0xffc0) : 0;
++    Key k{n.def, variant, (int16_t)bucket};
++    auto it = g_cache.find(k);
++    if (it != g_cache.end()) { it->second.lastUse = g_frameNo; return it->second.empty ? nullptr : &it->second; }
++    // (tests are deterministic: everything is rasterized in the frame that needs it)
++    if (g_renderCfg.rasterWaitMs < 1e8 && g_rasterSpentMs > kRasterBudgetMs) { g_rstats.rasterDeferred++; return nullptr; }
++    RasterSrc s; s.kind = n.objKind; s.def = n.def; s.ratio = n.ratio; s.argb = n.argb;
++    if (n.text >= 0) s.text = &g_cur->texts[n.text];
++    auto t0 = Clock::now();
++    Entry e; e.lastUse = g_frameNo;
++    if (!rasterizeSrc(s, scale, e.r) || e.r.w < 1 || e.r.h < 1) { e.empty = true; e.r = Raster(); }
++    else buildRuns(e.r.px.data(), e.r.w, e.r.h, e.r.w, e.runs);
++    double ms = msSince(t0);
++    g_rstats.rasters++; g_rstats.rasterMs += ms; g_rasterSpentMs += ms;
++    static const bool log = getenv("ISAAC_SOFT_RASTERLOG") != nullptr;   // (testing) every graphic rasterized
++    if (log) logf("[raster] frame %u: char %u kind %d variant %u scale %.4f -> %dx%d in %.2f ms (cache %zu KB, %zu entries)\n", g_frameNo,
++                  (unsigned)n.def->id, n.objKind, variant, scale, e.r.w, e.r.h, ms, g_cacheBytes >> 10, g_cache.size());
++    e.bytes = e.r.px.size() * 4 + runsBytes(e.runs) + 64;
++    g_cacheBytes += e.bytes;
++    g_cache[k] = std::move(e);
++    cacheTrim();
++    auto it2 = g_cache.find(k);   // (still there: entries of this frame are never dropped)
++    return it2 == g_cache.end() || it2->second.empty ? nullptr : &it2->second;
++}
++
++// Graphics far bigger than the stage (a whole-level overlay, say: 1705x1705 at the PSP stage's scale), of which only a
++// part shows: that part alone is rasterized, at its place on the canvas, and kept while it stays there (the key has the
++// whole transform, its translation in 1/16 px).
++struct BigKey {
++    const void* def; uint32_t variant; int32_t q[6]; int16_t box[4];
++    bool operator==(const BigKey& o) const { return def == o.def && variant == o.variant && !memcmp(q, o.q, sizeof q) && !memcmp(box, o.box, sizeof box); }
++};
++struct BigKeyHash {
++    size_t operator()(const BigKey& k) const {
++        size_t h = std::hash<const void*>()(k.def) ^ k.variant * 0x9e3779b1u;
++        for (int i = 0; i < 6; i++) h = h * 1000003u ^ (uint32_t)k.q[i];
++        for (int i = 0; i < 4; i++) h = h * 1000003u ^ (uint16_t)k.box[i];
++        return h;
++    }
++};
++std::unordered_map<BigKey, Entry, BigKeyHash> g_big;
++size_t g_bigBytes = 0;
++const size_t kBigBudget = 3u << 20;
++
++// Whether a display object is where it was in the previous frame (same transform, to 1/4096 and 1/16 px). A large
++// graphic that is stretched or turned (so its raster can't be copied 1:1) but doesn't move is rasterized at that
++// very transform once (bigRasterFor) and copied from then on; one that moves is resampled every frame.
++struct LastM { int32_t q[6]; uint32_t frame = 0; bool still = false; };
++std::unordered_map<uint32_t, LastM> g_lastM;   // by display object uid
++bool stillTransform(uint32_t uid, const FMat& m) {
++    LastM& l = g_lastM[uid];
++    if (l.frame == g_frameNo) return l.still;   // (decided once per frame: a mask is drawn twice, and both must match)
++    int32_t q[6] = {(int32_t)std::lround(m.a * 4096), (int32_t)std::lround(m.b * 4096), (int32_t)std::lround(m.c * 4096),
++                    (int32_t)std::lround(m.d * 4096), (int32_t)std::lround(m.tx * 16), (int32_t)std::lround(m.ty * 16)};
++    l.still = l.frame && l.frame + 1 == g_frameNo && !memcmp(l.q, q, sizeof q);
++    memcpy(l.q, q, sizeof q); l.frame = g_frameNo;
++    return l.still;
++}
++Entry* bigRasterFor(const SnapNode& n, const FMat& m, int x0, int y0, int w, int h) {
++    uint32_t variant = n.objKind == OK_EDITTEXT ? n.textVersion : n.objKind == OK_MORPH ? (uint32_t)(n.ratio & 0xffc0) : 0;
++    BigKey k{n.def, variant, {(int32_t)std::lround(m.a * 4096), (int32_t)std::lround(m.b * 4096), (int32_t)std::lround(m.c * 4096),
++             (int32_t)std::lround(m.d * 4096), (int32_t)std::lround(m.tx * 16), (int32_t)std::lround(m.ty * 16)},
++             {(int16_t)x0, (int16_t)y0, (int16_t)w, (int16_t)h}};
++    auto it = g_big.find(k);
++    if (it != g_big.end()) { it->second.lastUse = g_frameNo; return it->second.empty ? nullptr : &it->second; }
++    if (g_renderCfg.rasterWaitMs < 1e8 && g_rasterSpentMs > kRasterBudgetMs) { g_rstats.rasterDeferred++; return nullptr; }
++    RasterSrc s; s.kind = n.objKind; s.def = n.def; s.ratio = n.ratio; s.argb = n.argb;
++    if (n.text >= 0) s.text = &g_cur->texts[n.text];
++    auto t0 = Clock::now();
++    Entry e; e.lastUse = g_frameNo;
++    Mat dm; dm.a = m.a; dm.b = m.b; dm.c = m.c; dm.d = m.d; dm.tx = m.tx; dm.ty = m.ty;
++    if (!rasterizeSrcAt(s, dm, x0, y0, w, h, e.r)) { e.empty = true; e.r = Raster(); }
++    else buildRuns(e.r.px.data(), e.r.w, e.r.h, e.r.w, e.runs);
++    double ms = msSince(t0);
++    g_rstats.rasters++; g_rstats.rasterMs += ms; g_rasterSpentMs += ms;
++    e.bytes = e.r.px.size() * 4 + runsBytes(e.runs) + 64;
++    // (the oldest go first; those of this frame stay)
++    while (g_bigBytes + e.bytes > kBigBudget) {
++        auto old = g_big.end();
++        for (auto i = g_big.begin(); i != g_big.end(); ++i) if (i->second.lastUse != g_frameNo && (old == g_big.end() || i->second.lastUse < old->second.lastUse)) old = i;
++        if (old == g_big.end()) break;
++        g_bigBytes -= old->second.bytes; g_big.erase(old);
++    }
++    g_bigBytes += e.bytes;
++    Entry& ref = g_big[k] = std::move(e);
++    return ref.empty ? nullptr : &ref;
++}
++
++// ---------------------------------------------------------------- runs of the BitmapData on screen
++struct BmRuns { uint32_t version = 0, lastChange = 0, lastUse = 0; int w = 0, h = 0, streak = 0; bool valid = false; Runs runs; };
++std::unordered_map<uint32_t, BmRuns> g_bmRuns;   // by BitmapData uid
++const Runs* bitmapRuns(const SnapNode& n) {
++    BmRuns& b = g_bmRuns[n.bmUid];
++    b.lastUse = g_frameNo;
++    bool changed = b.version != n.bmVersion || b.w != n.bmW || b.h != n.bmH;
++    if (!changed && b.valid) return &b.runs;
++    if (changed) {
++        b.streak = b.lastChange + 1 == g_frameNo ? b.streak + 1 : 0;
++        b.lastChange = g_frameNo; b.version = n.bmVersion; b.w = n.bmW; b.h = n.bmH; b.valid = false;
++        if (b.streak >= 2) return nullptr;   // (it changes every frame: indexing it would cost as much as drawing it)
++    }
++    buildRuns(n.bmPx, n.bmW, n.bmH, n.bmW, b.runs);
++    b.valid = true;
++    return &b.runs;
++}
++
++// ---------------------------------------------------------------- the display list
++// the canvas pixels a rectangle of local space covers (clipped to the canvas, with a 2 px margin)
++bool canvasBox(const FMat& m, const RectF& b, int& x0, int& y0, int& x1, int& y1) {
++    float xs[4], ys[4];
++    m.apply((float)b.x0, (float)b.y0, xs[0], ys[0]); m.apply((float)b.x1, (float)b.y0, xs[1], ys[1]);
++    m.apply((float)b.x0, (float)b.y1, xs[2], ys[2]); m.apply((float)b.x1, (float)b.y1, xs[3], ys[3]);
++    x0 = std::max(0, (int)std::floor(std::min({xs[0], xs[1], xs[2], xs[3]})) - 2);
++    x1 = std::min(g_cw, (int)std::ceil(std::max({xs[0], xs[1], xs[2], xs[3]})) + 2);
++    y0 = std::max(0, (int)std::floor(std::min({ys[0], ys[1], ys[2], ys[3]})) - 2);
++    y1 = std::min(g_ch, (int)std::ceil(std::max({ys[0], ys[1], ys[2], ys[3]})) + 2);
++    return x1 > x0 && y1 > y0;
++}
++bool onCanvas(const FMat& m, const RectF& b) { int x0, y0, x1, y1; return canvasBox(m, b, x0, y0, x1, y1); }
++void drawNode(uint32_t i, const FMat& parent, const CX& pcx, Mode mode);
++std::vector<uint32_t> g_kidStack;   // (children lists of the containers being drawn, without an allocation each)
++void drawChildren(uint32_t i, const FMat& m, const CX& cx, Mode mode) {
++    const std::vector<SnapNode>& N = g_cur->nodes;
++    size_t base = g_kidStack.size();
++    for (uint32_t j = i + 1; j < N[i].end; j = N[j].end) g_kidStack.push_back(j);
++    size_t nk = g_kidStack.size() - base;
++    for (size_t q = 0; q < nk; q++) {
++        uint32_t kq = g_kidStack[base + q];
++        const SnapNode& k = N[kq];
++        if (k.clipDepth && mode == M_DRAW) {
++            // a mask: everything up to its clip depth is drawn only where the mask is
++            size_t e = q + 1;
++            while (e < nk && N[g_kidStack[base + e]].depth <= k.clipDepth) e++;
++            if (g_level < 254) {
++                g_stencilUsed = true;
++                drawNode(kq, m, cx, M_PUSH);
++                g_level++;
++                for (size_t r = q + 1; r < e; r++) drawNode(g_kidStack[base + r], m, cx, M_DRAW);
++                g_level--;
++                drawNode(kq, m, cx, M_POP);
++            }
++            q = e - 1;
++            continue;
++        }
++        drawNode(kq, m, cx, mode);
++    }
++    g_kidStack.resize(base);
++}
++void drawNode(uint32_t i, const FMat& parent, const CX& pcx, Mode mode) {
++    const SnapNode& n = g_cur->nodes[i];
++    if (!n.visible && mode == M_DRAW) return;
++    FMat m = parent * FMat(n.m);
++    CX cx = mode == M_DRAW ? pcx * n.cx : CX();
++    if (mode == M_DRAW && cx.am <= 0 && cx.aa <= 0) return;
++    switch (n.kind) {
++        case SN_CONTAINER: drawChildren(i, m, cx, mode); break;
++        case SN_BITMAP: {
++            if (!n.bmPx) break;
++            Tex t{n.bmPx, n.bmW, n.bmH, n.bmW, bitmapRuns(n)};
++            drawTex(t, m, cx, mode, n.smoothing || maxScale(m) < 0.999f);
++            g_rstats.draws++;
++            break;
++        }
++        case SN_CONTENT: {
++            float sc = maxScale(m);
++            int x0 = 0, y0 = 0, x1 = g_cw, y1 = g_ch;
++            // rasterized right at this transform, where it shows (bigRasterFor), and copied 1:1
++            auto atTransform = [&]() {
++                Entry* e = bigRasterFor(n, m, x0, y0, x1 - x0, y1 - y0);
++                if (!e) return;
++                Tex t{e->r.px.data(), e->r.w, e->r.h, e->r.w, &e->runs};
++                drawTex(t, FMat(1, 0, 0, 1, (float)e->r.x0, (float)e->r.y0), cx, mode, true);
++                g_rstats.draws++;
++            };
++            if (n.hasBounds) {
++                if (!canvasBox(m, n.bounds, x0, y0, x1, y1)) break;   // (off the stage: not even rasterized)
++                double full = (n.bounds.x1 - n.bounds.x0) * sc * (n.bounds.y1 - n.bounds.y0) * sc;
++                if (full > 2.0 * g_cw * g_ch && (double)(x1 - x0) * (y1 - y0) < full * 0.5) { atTransform(); break; }   // (far bigger than what shows)
++            }
++            Entry* e = rasterFor(n, sc);
++            if (!e) break;
++            const Raster& r = e->r;
++            float inv = (float)(1.0 / r.scale);
++            FMat S(inv, 0, 0, inv, (float)r.x0, (float)r.y0);   // texel -> local
++            FMat A = m * S;
++            const float kEps = 1e-3f;
++            bool oneToOne = std::fabs(A.b) < kEps && std::fabs(A.c) < kEps && std::fabs(std::fabs(A.a) - 1) < kEps && std::fabs(std::fabs(A.d) - 1) < kEps;
++            // large, stretched or turned, and still: once at its transform rather than resampled every frame
++            if (!oneToOne && n.hasBounds && (x1 - x0) * (y1 - y0) >= 4096 && stillTransform(n.uid, m)) { atTransform(); break; }
++            Tex t{r.px.data(), r.w, r.h, r.w, &e->runs};
++            drawTex(t, A, cx, mode, true);
++            g_rstats.draws++;
++            break;
++        }
++    }
++}
++
++// ---------------------------------------------------------------- output: the canvas scaled, then text
++// Area averaging (downscaling: every source pixel counts for the part of it each output pixel covers), linear when
++// enlarging. Weights in 1/256, at most 4 source pixels per output pixel and axis.
++struct Taps { int src = 0, n = 0; uint16_t w[4] = {}; };
++std::vector<Taps> g_tapsX, g_tapsY; int g_tapsFor[4] = {};
++void buildTaps(int srcN, int dstN, std::vector<Taps>& out) {
++    out.assign(dstN, Taps());
++    double sc = (double)srcN / dstN;
++    for (int j = 0; j < dstN; j++) {
++        Taps& t = out[j]; double wf[4] = {};
++        if (sc <= 1) {   // enlarging (or 1:1): linear between the two nearest
++            double c = (j + 0.5) * sc - 0.5; int s0 = (int)std::floor(c); double f = c - s0;
++            if (s0 < 0) { s0 = 0; f = 0; } if (s0 >= srcN - 1) { s0 = srcN - 1; f = 0; }
++            t.src = s0; t.n = f > 0 ? 2 : 1; wf[0] = 1 - f; wf[1] = f;
++        } else {
++            double a = j * sc, b = (j + 1) * sc; int s0 = (int)std::floor(a), s1 = std::min(srcN, (int)std::ceil(b));
++            t.src = s0; t.n = std::min(4, s1 - s0);
++            for (int k = 0; k < t.n; k++) wf[k] = (std::min(b, (double)s0 + k + 1) - std::max(a, (double)s0 + k)) / sc;
++        }
++        int sum = 0;
++        for (int k = 0; k < t.n; k++) { t.w[k] = (uint16_t)std::lround(wf[k] * 256); sum += t.w[k]; }
++        t.w[0] = (uint16_t)(t.w[0] + 256 - sum);   // (exactly 256 in all)
++    }
++}
++// the output rectangle of the stage (window pixels)
++void outRect(int& x0, int& y0, int& w, int& h) {
++    if (g_softStretch) { x0 = 0; y0 = 0; w = g_winW; h = g_winH; return; }
++    Mat st = stageToWindowFor(g_winW, g_winH);
++    x0 = (int)st.tx; y0 = (int)st.ty;
++    w = std::min(g_winW - x0, (int)std::lround(g_cw * st.a)); h = std::min(g_winH - y0, (int)std::lround(g_ch * st.d));
++}
++void scaleCanvas() {
++    int ox, oy, ow, oh; outRect(ox, oy, ow, oh);
++    if (ow <= 0 || oh <= 0) return;
++    if (g_tapsFor[0] != g_cw || g_tapsFor[1] != g_ch || g_tapsFor[2] != ow || g_tapsFor[3] != oh) {
++        buildTaps(g_cw, ow, g_tapsX); buildTaps(g_ch, oh, g_tapsY);
++        g_tapsFor[0] = g_cw; g_tapsFor[1] = g_ch; g_tapsFor[2] = ow; g_tapsFor[3] = oh;
++    }
++    // Vertically first: whole rows of the canvas at a time (16 bytes per NEON step on the console), into oh rows of the
++    // canvas's width plus 2 spare pixels, so that the horizontal pass can always read three. Weights in 1/128 there
++    // (three byte products then fit 16 bits), the same on every machine so that screenshots compare.
++    const int tw = g_cw + 2;
++    g_tmp.resize((size_t)oh * tw);
++    for (int y = 0; y < oh; y++) {
++        const Taps& t = g_tapsY[y];
++        uint32_t* d = &g_tmp[(size_t)y * tw];
++        const uint32_t* r0 = &g_canvas[(size_t)t.src * g_cw];
++        int x = 0;
++        if (t.n <= 3) {
++            const uint32_t* r1 = t.n > 1 ? r0 + g_cw : r0;
++            const uint32_t* r2 = t.n > 2 ? r0 + 2 * g_cw : r0;
++            uint32_t b7 = (t.w[1] + 1) >> 1, c7 = (t.w[2] + 1) >> 1, a7 = 128 - b7 - c7;
++#if defined(__ARM_NEON)
++            uint8x8_t va = vdup_n_u8((uint8_t)a7), vb = vdup_n_u8((uint8_t)b7), vc = vdup_n_u8((uint8_t)c7);
++            const uint8_t* p0 = (const uint8_t*)r0; const uint8_t* p1 = (const uint8_t*)r1; const uint8_t* p2 = (const uint8_t*)r2;
++            uint8_t* pd = (uint8_t*)d;
++            int nb = g_cw * 4, i = 0;
++            for (; i + 16 <= nb; i += 16) {
++                uint8x16_t x0 = vld1q_u8(p0 + i), x1 = vld1q_u8(p1 + i), x2 = vld1q_u8(p2 + i);
++                uint16x8_t lo = vmull_u8(vget_low_u8(x0), va); lo = vmlal_u8(lo, vget_low_u8(x1), vb); lo = vmlal_u8(lo, vget_low_u8(x2), vc);
++                uint16x8_t hi = vmull_u8(vget_high_u8(x0), va); hi = vmlal_u8(hi, vget_high_u8(x1), vb); hi = vmlal_u8(hi, vget_high_u8(x2), vc);
++                vst1q_u8(pd + i, vcombine_u8(vrshrn_n_u16(lo, 7), vrshrn_n_u16(hi, 7)));
++            }
++            x = i / 4;
++#endif
++            // (two channels per 32-bit word, R and B, A and G: each 16-bit lane holds at most 255 * 128 + 64)
++            for (; x < g_cw; x++) {
++                uint32_t p = r0[x], q = r1[x], s = r2[x];
++                uint32_t rb = 0x00400040u + (p & 0x00ff00ffu) * a7 + (q & 0x00ff00ffu) * b7 + (s & 0x00ff00ffu) * c7;
++                uint32_t ag = 0x00400040u + ((p >> 8) & 0x00ff00ffu) * a7 + ((q >> 8) & 0x00ff00ffu) * b7 + ((s >> 8) & 0x00ff00ffu) * c7;
++                d[x] = ((rb >> 7) & 0x00ff00ffu) | ((ag << 1) & 0xff00ff00u);
++            }
++        } else {   // (shrinking more than 3 times: not the FunKey's 272 -> 180)
++            for (; x < g_cw; x++) {
++                uint32_t rb = 0x00800080u, ag = 0x00800080u;
++                for (int k = 0; k < t.n; k++) { uint32_t p = r0[(size_t)k * g_cw + x], w = t.w[k]; rb += (p & 0x00ff00ffu) * w; ag += ((p >> 8) & 0x00ff00ffu) * w; }
++                d[x] = ((rb >> 8) & 0x00ff00ffu) | (ag & 0xff00ff00u);
++            }
++        }
++        d[g_cw] = d[g_cw + 1] = d[g_cw - 1];
++    }
++    // then horizontally, into the output: three taps always (weights 0 past the ones used), in 1/256
++    for (int y = 0; y < oh; y++) {
++        const uint32_t* s = &g_tmp[(size_t)y * tw];
++        uint32_t* d = &g_win[(size_t)(oy + y) * g_winW + ox];
++        for (int x = 0; x < ow; x++) {
++            const Taps& t = g_tapsX[x];
++            const uint32_t* p = s + t.src;
++            uint32_t w0 = t.w[0], w1 = t.w[1], w2 = t.w[2];
++            uint32_t rb = 0x00800080u + (p[0] & 0x00ff00ffu) * w0 + (p[1] & 0x00ff00ffu) * w1 + (p[2] & 0x00ff00ffu) * w2;
++            uint32_t ag = 0x00800080u + ((p[0] >> 8) & 0x00ff00ffu) * w0 + ((p[1] >> 8) & 0x00ff00ffu) * w1 + ((p[2] >> 8) & 0x00ff00ffu) * w2;
++            if (t.n > 3) { rb += (p[3] & 0x00ff00ffu) * t.w[3]; ag += ((p[3] >> 8) & 0x00ff00ffu) * t.w[3]; }
++            d[x] = 0xff000000u | ((rb >> 8) & 0x00ff00ffu) | (ag & 0x0000ff00u);
++        }
++    }
++}
++void fillWin(int x0, int y0, int x1, int y1, uint32_t argb) {
++    x0 = std::max(0, x0); y0 = std::max(0, y0); x1 = std::min(g_winW, x1); y1 = std::min(g_winH, y1);
++    uint32_t a = argb >> 24;
++    for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) {
++        uint32_t& d = g_win[(size_t)y * g_winW + x];
++        if (a == 255) d = argb;
++        else if (a) {   // (straight alpha in, premultiplied over the opaque output)
++            uint32_t s = a << 24 | (((argb >> 16) & 255) * a / 255) << 16 | (((argb >> 8) & 255) * a / 255) << 8 | ((argb & 255) * a / 255);
++            blendOver(d, s); d |= 0xff000000u;
++        }
++    }
++}
++#include "font5x7.inc"
++void drawText(const TextItem& t) {
++    const Glyph* table[128] = {};
++    for (auto& f : kFont) table[(unsigned char)f.c] = &f;
++    const int cw = 6, lh = 9;
++    for (size_t li = 0; li < t.lines.size(); li++) {
++        const std::string& L = t.lines[li];
++        int x0 = (int)t.x, y0 = (int)t.y + (int)li * lh * t.px;
++        fillWin(x0, y0, x0 + ((int)L.size() * cw + 2) * t.px, y0 + lh * t.px, t.paper);
++        for (size_t ci = 0; ci < L.size(); ci++) {
++            unsigned char c = (unsigned char)toupper((unsigned char)L[ci]);
++            const Glyph* gl = c < 128 ? table[c] : nullptr; if (!gl) continue;
++            for (int r = 0; r < 7; r++) for (int k = 0; k < 5; k++) if (gl->r[r][k] == '#') {
++                int px = x0 + (1 + (int)ci * cw + k) * t.px, py = y0 + (1 + r) * t.px;
++                fillWin(px, py, px + t.px, py + t.px, t.ink);
++            }
++        }
++    }
++}
++void beginFrame(uint32_t clearArgb) {
++    g_frameNo++; g_texts.clear(); g_focusOn = false; g_sceneDrawn = false; g_clearArgb = clearArgb;
++}
++}  // namespace
++
++// ---------------------------------------------------------------- interface (render.h)
++bool renderInit() {
++    g_cacheBudget = 8u << 20;   // (a room's graphics at the PSP stage's scale: about 4-6 MB; M3 measures it on the console)
++    if (const char* e = getenv("ISAAC_SOFT_CACHE_KB")) g_cacheBudget = (size_t)atol(e) << 10;   // (testing)
++    if (getenv("ISAAC_SOFT_STRETCH")) g_softStretch = true;   // (testing: the whole window, like the FunKey's "full")
++    return true;
++}
++Mat stageToWindowFor(int winW, int winH) {
++    double s = std::min((double)winW / g_stageW, (double)winH / g_stageH);
++    Mat m; m.a = m.d = s; m.tx = std::floor((winW - g_stageW * s) / 2); m.ty = std::floor((winH - g_stageH * s) / 2);
++    return m;
++}
++void renderAdopt(const SnapPtr& s) {   // (BitmapData are drawn from their own pixels: no uploads)
++    g_cur = s;
++    for (uint32_t uid : s->freedBitmaps) g_bmRuns.erase(uid);
++}
++void renderFreeRetired() {}
++const Snapshot* renderCurrent() { return g_cur.get(); }
++void renderFrame(int winW, int winH, double) {
++    beginFrame(0xff000000u);
++    g_winW = winW; g_winH = winH;
++    g_stageToWindow = g_softStretch ? Mat{(double)winW / g_stageW, 0, 0, (double)winH / g_stageH, 0, 0} : stageToWindowFor(winW, winH);
++    if (!g_cur || g_stageW <= 0 || g_stageH <= 0) return;
++    if (g_cw != g_stageW || g_ch != g_stageH) {
++        g_cw = g_stageW; g_ch = g_stageH;
++        g_canvas.assign((size_t)g_cw * g_ch, 0); g_stencil.assign((size_t)g_cw * g_ch, 0);
++    }
++    if (g_stencilUsed) { std::fill(g_stencil.begin(), g_stencil.end(), 0); g_stencilUsed = false; }
++    if (g_frameNo % 64 == 0) {   // (runs of BitmapData no longer drawn, transforms of objects gone)
++        for (auto it = g_bmRuns.begin(); it != g_bmRuns.end();) { if (it->second.lastUse + 120 < g_frameNo) it = g_bmRuns.erase(it); else ++it; }
++        for (auto it = g_lastM.begin(); it != g_lastM.end();) { if (it->second.frame + 120 < g_frameNo) it = g_lastM.erase(it); else ++it; }
++    }
++    uint32_t bg = 0xff000000u | (g_cur->bgColor & 0xffffff);
++    std::fill(g_canvas.begin(), g_canvas.end(), bg);
++    g_level = 0; g_rasterSpentMs = 0;
++    auto t0 = Clock::now();
++    if (!g_cur->nodes.empty()) drawNode(0, FMat(), CX(), M_DRAW);
++    g_rstats.execMs += msSince(t0);
++    g_rstats.nodes = (int)g_cur->nodes.size();
++    g_sceneDrawn = true;
++    if (g_cur->focusOn) {   // controller focus (menuui.cpp): a frame around the selected option, drawn on the output
++        g_focusOn = true; g_focusStrong = g_cur->focusStrong;
++        for (int k = 0; k < 4; k++) g_focus[k] = g_cur->focusRect[k];
++    }
++}
++void renderEndFrame() {
++    if (g_winW <= 0 || g_winH <= 0) return;
++    g_win.assign((size_t)g_winW * g_winH, g_sceneDrawn ? 0xff000000u : g_clearArgb);
++    if (g_sceneDrawn) {
++        auto t0 = Clock::now();
++        scaleCanvas();
++        g_rstats.uploadMs += msSince(t0);   // (the "upload" of this renderer: the scaling to the output)
++    }
++    if (g_focusOn) {
++        int ox, oy, ow, oh; outRect(ox, oy, ow, oh);
++        double sx = (double)ow / g_cw, sy = (double)oh / g_ch;
++        int x0 = ox + (int)std::floor(g_focus[0] * sx), y0 = oy + (int)std::floor(g_focus[1] * sy);
++        int x1 = ox + (int)std::ceil(g_focus[2] * sx), y1 = oy + (int)std::ceil(g_focus[3] * sy);
++        uint32_t c = g_focusStrong ? 0xff8c1212u : 0xffc88888u;
++        fillWin(x0 - 1, y0 - 1, x1 + 1, y0, c); fillWin(x0 - 1, y1, x1 + 1, y1 + 1, c);
++        fillWin(x0 - 1, y0, x0, y1, c); fillWin(x1, y0, x1 + 1, y1, c);
++    }
++    for (auto& t : g_texts) drawText(t);
++}
++// the output frame (after renderEndFrame): ARGB, g_winW x g_winH; FunKey's display code converts it
++const uint32_t* renderSoftOutput(int* w, int* h) { *w = g_winW; *h = g_winH; return g_win.empty() ? nullptr : g_win.data(); }
++bool renderScreenshot(const char* path) {
++    if (g_win.empty()) return false;
++    FILE* f = fopen(path, "wb"); if (!f) return false;
++    std::string p = path;
++    bool bmp = p.size() > 4 && p.substr(p.size() - 4) == ".bmp";
++    if (bmp) {   // 24-bit, bottom-up
++        int rowB = (g_winW * 3 + 3) & ~3; uint32_t size = 54 + (uint32_t)rowB * g_winH;
++        uint8_t h[54] = {'B', 'M'};
++        auto put32 = [&](int o, uint32_t v) { h[o] = v & 255; h[o + 1] = (v >> 8) & 255; h[o + 2] = (v >> 16) & 255; h[o + 3] = v >> 24; };
++        put32(2, size); put32(10, 54); put32(14, 40); put32(18, (uint32_t)g_winW); put32(22, (uint32_t)g_winH);
++        h[26] = 1; h[28] = 24; put32(34, (uint32_t)rowB * g_winH);
++        fwrite(h, 1, 54, f);
++        std::vector<uint8_t> row(rowB, 0);
++        for (int y = g_winH - 1; y >= 0; y--) {
++            for (int x = 0; x < g_winW; x++) { uint32_t c = g_win[(size_t)y * g_winW + x]; row[x * 3] = c & 255; row[x * 3 + 1] = (c >> 8) & 255; row[x * 3 + 2] = (c >> 16) & 255; }
++            fwrite(row.data(), 1, rowB, f);
++        }
++    } else {   // PPM, as render.cpp writes them
++        fprintf(f, "P6\n%d %d\n255\n", g_winW, g_winH);
++        std::vector<uint8_t> row((size_t)g_winW * 3);
++        for (int y = 0; y < g_winH; y++) {
++            for (int x = 0; x < g_winW; x++) { uint32_t c = g_win[(size_t)y * g_winW + x]; row[x * 3] = (c >> 16) & 255; row[x * 3 + 1] = (c >> 8) & 255; row[x * 3 + 2] = c & 255; }
++            fwrite(row.data(), 1, row.size(), f);
++        }
++    }
++    fclose(f);
++    return true;
++}
++void renderOverlay(const std::vector<std::string>& lines) { if (!lines.empty()) g_texts.push_back({lines, 2, 2, 1, 0xffffff8cu, 0xa6000000u}); }
++void renderHint(const std::string& text) {
++    if (!text.empty()) g_texts.push_back({{text}, (float)(g_winW - 6 * (int)text.size() - 8), (float)(g_winH - 14), 1, 0xffffffffu, 0xa6000000u});
++}
++void renderLoadingScreen(int winW, int winH, float frac) {
++    beginFrame(0xff000000u); g_winW = winW; g_winH = winH;
++    char b[32]; snprintf(b, sizeof b, "LOADING %d%%", (int)(frac * 100));
++    int px = winW >= 320 ? 2 : 1;
++    g_texts.push_back({{b}, (float)(winW / 2 - 30 * px), (float)(winH / 2 - 5 * px), px, 0xffffffffu, 0xff000000u});
++}
++void renderChooser(int winW, int winH, const std::string& title, const std::vector<std::string>& items, int sel, const std::string& hint,
++                   std::vector<std::array<int, 4>>* rects) {
++    beginFrame(0xff101010u); g_winW = winW; g_winH = winH;
++    int px = winW >= 400 ? 2 : 1, m = 8 * px;
++    g_texts.push_back({{title}, (float)m, (float)m, px, 0xffffffffu, 0xff101010u});
++    for (size_t i = 0; i < items.size(); i++) {
++        bool on = (int)i == sel;
++        float y = (float)(m + 24 * px + 14 * px * (int)i);
++        g_texts.push_back({{(on ? "> " : "  ") + items[i]}, (float)m, y, px, on ? 0xffff8888u : 0xffc0c0c0u, 0xff101010u});
++        if (rects) rects->push_back({m, (int)y, winW - 2 * m, 12 * px});
++    }
++    if (!hint.empty()) g_texts.push_back({{hint}, (float)m, (float)(winH - 12 * px), 1, 0xff909090u, 0xff101010u});
++}
++void renderTouchSticks(const TouchStick*, int) {}
++void renderPauseButton(double, double, double, double) {}
++void renderPreload(const std::vector<PreKey>&, int, int, const std::function<void(float)>&) {}
++size_t renderPreloadPending() { return 0; }
++std::vector<PreKey> renderTakeLearned() { return {}; }
++void renderMarkKnown(const std::vector<PreKey>&) {}
++// (main.cpp's GPU pacing: nothing to wait for)
++void renderFinish() {}
++void renderPaceAfterSwap() {}
++bool renderPaceWait(uint64_t) { return true; }
++int renderAtlasPages() { return (int)(g_cacheBytes >> 20); }
++// (diagnostics) memory held by the renderer: rasterized graphics, and the frame buffers
++void renderMemStats(size_t* pages, size_t* bitmaps) {
++    *pages = g_cacheBytes;
++    *bitmaps = g_canvas.size() * 4 + g_stencil.size() + g_win.size() * 4 + g_tmp.size() * 4;
++}
++}  // namespace fl
+diff --git a/rt/snapshot.cpp b/rt/snapshot.cpp
+index fa67ef5..e26c30e 100644
+--- a/rt/snapshot.cpp
++++ b/rt/snapshot.cpp
+@@ -16,6 +16,12 @@ void bitmapGone(BitmapData* b) {   // destroyed or released (dispose)
+ 
+ static uint32_t g_serial = 0;
+ bool bdUseGpu(BitmapData* b);
++// the renderer draws BitmapData from their own pixels (one thread: valid until the next tick): PSP, FunKey
++#if defined(__PSP__) || defined(ISAAC_FUNKEY)
++static constexpr bool kBmInPlace = true;
++#else
++static constexpr bool kBmInPlace = false;
++#endif
+ static void addBitmap(Snapshot& s, BitmapData* b) {
+     if (b->snapSerial == s.serial) return;   // already included in this snapshot
+     b->snapSerial = s.serial;
+@@ -34,6 +40,9 @@ static void addBitmap(Snapshot& s, BitmapData* b) {
+     // (PSP: one thread, and the GE is idle between frames: straight into the renderer's texture, without a copy)
+     extern void pspBitmapUpload(uint32_t uid, int w, int h, int x0, int y0, int x1, int y1, const uint32_t* px);
+     pspBitmapUpload(b->uid, b->w, b->h, x0, y0, x1, y1, b->px.data());
++#elif defined(ISAAC_FUNKEY)
++    // (FunKey: one thread and no GPU: the renderer draws the BitmapData's own pixels, SnapNode::bmPx; nothing to copy)
++    (void)x0; (void)y0; (void)x1; (void)y1;
+ #else
+     BitmapUpload up; up.uid = b->uid; up.w = b->w; up.h = b->h; up.x0 = x0; up.y0 = y0; up.x1 = x1; up.y1 = y1;
+     int w = x1 - x0;
+@@ -61,7 +70,7 @@ static void addNode(Snapshot& s, DisplayObject* d, int32_t parent) {
+             case OK_BITMAP: {
+                 n.kind = SN_BITMAP;
+                 BitmapObj* bo = (BitmapObj*)d;
+-                if (bo->bd) { BitmapData* b = bo->bd; addBitmap(s, b); n.bmUid = b->uid; n.bmW = b->w; n.bmH = b->h; n.smoothing = bo->smoothing; if (kPxABGR && b->px.size() >= (size_t)b->w * b->h) n.bmPx = b->px.data(); }
++                if (bo->bd) { BitmapData* b = bo->bd; addBitmap(s, b); n.bmUid = b->uid; n.bmW = b->w; n.bmH = b->h; n.smoothing = bo->smoothing; n.bmVersion = b->version; if (kBmInPlace && b->px.size() >= (size_t)b->w * b->h) n.bmPx = b->px.data(); }
+                 break;
+             }
+             case OK_SHAPE: case OK_MORPH: case OK_TEXT: case OK_EDITTEXT: {
+diff --git a/rt/snapshot.h b/rt/snapshot.h
+index 8eddbf2..5568503 100644
+--- a/rt/snapshot.h
++++ b/rt/snapshot.h
+@@ -31,7 +31,8 @@ struct SnapNode {
+     RectF bounds; bool hasBounds = false;   // local bounds of the content
+     // bitmap (SN_BITMAP)
+     uint32_t bmUid = 0; int bmW = 0, bmH = 0; bool smoothing = false;
+-    const uint32_t* bmPx = nullptr;   // (PSP) the BitmapData's pixels, drawn in place (valid until the next tick)
++    const uint32_t* bmPx = nullptr;   // (PSP, FunKey) the BitmapData's pixels, drawn in place (valid until the next tick)
++    uint32_t bmVersion = 0;           // (FunKey) BitmapData::version: changes whenever its pixels do
+     // filters (blur only)
+     bool blur = false; float blurX = 0, blurY = 0; int blurPasses = 1;
+ };

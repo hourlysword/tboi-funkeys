@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Sun, 15 Nov 2026 22:09:26 -0500
+Subject: [PATCH] FunKey S: the room pieces kept on the card; a weak name
+ handed out again kept through the sweep
+
+The pieces a room's floor and walls are drawn from (BitmapData.draw's leaves) are rasterized the first time they are
+seen, most of a room entry on the console. Each piece rasterized is now also compressed (zlib 1) into
+saves/leaves_<SWF length>.data and listed in .index (read at start into a table), and a piece needed again, in a later
+room or session, is read back instead of being parsed and rasterized. Its key holds no pointer: the character's id and
+kind (shapes, morphs at their ratio, static text; only the game file's own characters), the matrix, the colour
+transform and the sub-pixel offset. The files belong to one build (the linker's build ID, now added with
+-Wl,--build-id) and one game file, else they start afresh; off with mods and with ISAAC_NO_LEAFDISK; up to 16 MB;
+pieces read back are checked (key, CRC). New pieces are written in the time left before the next tick (a queue of up
+to 512 KB of pixels, 4 ms a tick at most), not during the room's entry. On the console: the same rooms again, no room
+entry over 150 ms (9 without the pieces); other rooms, 25% of the pieces from the card after one session.
+
+Weak clip names (atomOfWeak, the previous patch): the collector frees garbage over the following ticks, and the game's
+names come back ("sz1" again), so a weak name found again in the intern table while still waiting to be freed was freed
+under its new clip (a crash building a removed clip's target path). internWeak now marks a weak name it hands out
+again while a sweep is in progress.
+---
+ CMakeLists.txt |   1 +
+ rt/core.cpp    |  10 ++-
+ rt/funkey.cpp  |  13 ++-
+ rt/main.cpp    |   4 +
+ rt/raster.cpp  | 232 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 254 insertions(+), 6 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2d09839..dfc552a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -240,6 +240,7 @@ if(NOT PSP)
+   if(ISAAC_FUNKEY)
+     target_compile_definitions(isaac PRIVATE ISAAC_FUNKEY)
+     target_compile_options(isaac PRIVATE -Wno-psabi)   # (GCC's note that an ABI changed in GCC 7.1, on every call)
++    target_link_options(isaac PRIVATE -Wl,--build-id=sha1)   # (the room pieces kept on the card belong to one build)
+   endif()
+ endif()
+ # on Windows it can't be named isaac.exe: Steam's Isaac.exe (with the game data) usually sits in the same folder
+diff --git a/rt/core.cpp b/rt/core.cpp
+index 9a1f287..296442c 100644
+--- a/rt/core.cpp
++++ b/rt/core.cpp
+@@ -193,7 +193,15 @@ Str* intern(std::string_view sv) {
+ Str* internWeak(std::string_view sv) {
+     if (!g_intern) g_intern = new std::unordered_map<std::string_view, Str*, SVHash>(1 << 14);
+     auto it = g_intern->find(sv);
+-    if (it != g_intern->end()) return it->second;
++    if (it != g_intern->end()) {
++        // A weak name found again while the collector frees the garbage tick by tick (lazy sweep) may be garbage still
++        // waiting to be freed: a name that comes back (the game's sound clips count from 1 again: "sz1"...) would
++        // then be freed under its new clip. Marked, it is kept through this sweep (alive or not: at worst one
++        // collection later).
++        Str* f = it->second;
++        if (f->weakAtom && !g_sweep.empty()) f->marked = 1;
++        return f;
++    }
+     Str* s = new Str(std::string(sv));
+     s->onHeap = 1; s->weakAtom = 1; s->interned = true; s->atom = s;
+     classify(s);
+diff --git a/rt/funkey.cpp b/rt/funkey.cpp
+index c358b01..83ea804 100644
+--- a/rt/funkey.cpp
++++ b/rt/funkey.cpp
+@@ -85,6 +85,8 @@ extern double g_leanReadMs; extern uint64_t g_leanReads, g_leanReadBytes; extern
+ void gcStats(size_t* objects, size_t* lastLive, size_t* extBytes); size_t internCount();             // (core.cpp)
+ std::string gcCensus(); std::string internPatterns(size_t top); void gcCollectFull();
+ extern size_t g_timelineBytes, g_timelines, g_timelineDrops;
++std::string leafDiskStats(); uint64_t leafDiskHits();   // (raster.cpp: the pieces kept on the card)
++bool leafDiskBusy(); void leafDiskIdle(double budgetMs);
+ void rasterMemNumbers(size_t* bmBytes, size_t* morphs, size_t* morphBytes, size_t* leaves, size_t* leafBytes);
+ 
+ namespace {
+@@ -840,7 +842,7 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+         }
+ 
+         // one logic tick
+-        const double bm0 = g_bmDrawMs, lp0 = g_lazyParseMs, lr0 = g_leafRasterMs, rd0 = g_leanReadMs; const uint64_t lm0 = g_leafMisses, lh0 = g_leafHits, rn0 = g_leanReads;
++        const double bm0 = g_bmDrawMs, lp0 = g_lazyParseMs, lr0 = g_leafRasterMs, rd0 = g_leanReadMs; const uint64_t lm0 = g_leafMisses, lh0 = g_leafHits, rn0 = g_leanReads, ld0 = leafDiskHits();
+         g_player.timeMs = scripted ? g_player.tick * 1000.0 / g_frameRate : (now() - clockStart) * 1000.0;
+         if (marks) logf("OFKMEM begin %u\n", g_player.tick);
+         double t0 = now(), c0 = threadCpuMs();
+@@ -890,13 +892,16 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+         // a long tick (mostly a room entry): what it was spent on
+         static const double slowMs = getenv("ISAAC_FUNKEY_SLOWMS") ? atof(getenv("ISAAC_FUNKEY_SLOWMS")) : 150;
+         if ((g1 - t0) * 1000 > slowMs)
+-            logf("[funkey] long tick %u: %.0f ms: logic %.0f (BitmapData.draw %.0f: %llu leaves rasterized in %.0f, %llu reused; parsing %.0f, of it %llu reads %.0f), picture %.0f, collector %.0f\n",
++            logf("[funkey] long tick %u: %.0f ms: logic %.0f (BitmapData.draw %.0f: %llu leaves rasterized or read in %.0f, %llu of them from the card, %llu reused; parsing %.0f, of it %llu reads %.0f), picture %.0f, collector %.0f\n",
+                  g_player.tick - 1, (g1 - t0) * 1000, (t1 - t0) * 1000, g_bmDrawMs - bm0, (unsigned long long)(g_leafMisses - lm0), g_leafRasterMs - lr0,
+-                 (unsigned long long)(g_leafHits - lh0), g_lazyParseMs - lp0, (unsigned long long)(g_leanReads - rn0), g_leanReadMs - rd0, pictureMs, (g1 - g0) * 1000);
++                 (unsigned long long)(leafDiskHits() - ld0), (unsigned long long)(g_leafHits - lh0), g_lazyParseMs - lp0, (unsigned long long)(g_leanReads - rn0), g_leanReadMs - rd0,
++                 pictureMs, (g1 - g0) * 1000);
+ 
+         // the clock: one tick every 1/30 s; a stall of more than half a second (a room being built) isn't caught up
+         next += dt;
+         double t = now();
++        // the room pieces rasterized lately, onto the card, in the time left before the next tick (4 ms at most)
++        if (next - t > 0.002 && leafDiskBusy()) { leafDiskIdle(std::min(4.0, (next - t) * 1000 - 1)); t = now(); }
+         static const bool noWait = getenv("ISAAC_FUNKEY_NOWAIT") != nullptr;   // (testing: a test script as fast as it runs)
+         if (t < next) { if (!noWait) inputWait(next - t); }
+         else if (t > next + 0.5) { next = t; w.stalls++; }
+@@ -933,6 +938,8 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+     logf("[funkey] BitmapData.draw %.0f ms in all: %llu leaves rasterized in %.0f ms, %llu reused; parsing %.0f ms (shapes %u, their hit edges %u); shapes read from the game file: %llu, %llu KB in %.0f ms\n", g_bmDrawMs,
+          (unsigned long long)g_leafMisses, g_leafRasterMs, (unsigned long long)g_leafHits, g_lazyParseMs, g_shapeParses, g_shapeHitParses,
+          (unsigned long long)g_leanReads, (unsigned long long)(g_leanReadBytes >> 10), g_leanReadMs);
++    if (!g_powerReq) leafDiskIdle(1e9);   // (the pieces still waiting; not when powering off: the save first)
++    logf("[funkey] leaves on the card: %s\n", leafDiskStats().c_str());
+     if (getenv("ISAAC_FUNKEY_CENSUS")) logf("[funkey] interned strings, the commonest patterns:\n%s", internPatterns(25).c_str());
+     if (g_powerReq) logf("[funkey] stopping for the power-off\n");
+     else if (g_stopReq) logf("[funkey] stopping: asked to\n");
+diff --git a/rt/main.cpp b/rt/main.cpp
+index 1f4ec81..8288f65 100644
+--- a/rt/main.cpp
++++ b/rt/main.cpp
+@@ -76,6 +76,7 @@ void rasterTrim(size_t budget);
+ #ifdef ISAAC_FUNKEY
+ void funkeyEarly(); uint64_t funkeyPlay(bool perfOverlay); void funkeyFinish();   // (funkey.cpp; funkeyPlay returns the pictures drawn)
+ int funkeyChooseGame(const std::vector<std::string>& names, int initial);           // (the version picker: -1 to quit)
++void leafDiskOpen(const std::string& dir, uint32_t swfLen);                          // (raster.cpp: pieces kept on the card)
+ #endif
+ }
+ // joystick_acceleration: how far the stick is pushed (0..1) -> movement factor. Below the dead zone nothing moves;
+@@ -808,6 +809,9 @@ int main(int argc, char** argv) {
+     g_joyAccel = cfg.joystickAcceleration;
+     applyLoadPatches();
+     logf("SWF loaded: v%d, %dx%d @ %.0f fps, recompiled stage %dx%d\n", g_movie.version, g_movie.width, g_movie.height, g_movie.frameRate, g_stageW, g_stageH);
++#ifdef ISAAC_FUNKEY
++    fl::leafDiskOpen(pref, found[choice].g->swfLen);   // (the pieces of rooms drawn in earlier sessions, raster.cpp)
++#endif
+     g_renderCfg.smooth = cfg.smooth; g_renderCfg.filters = cfg.filters; g_renderCfg.cacheMB = cfg.cacheMB;
+     if (kIsAndroid || getenv("ISAAC_MOBILE_FILTERS")) { g_renderCfg.filterBudget = 4; g_renderCfg.filterMaxAge = 3; g_renderCfg.filterLowRes = true; }
+     g_renderCfg.rasterWaitMs = headless ? 1e9 : kIsSwitch ? 3.0 : 6.0;   // (testing: always complete, deterministic)
+diff --git a/rt/raster.cpp b/rt/raster.cpp
+index 60fccbe..66da0fd 100644
+--- a/rt/raster.cpp
++++ b/rt/raster.cpp
+@@ -17,6 +17,14 @@
+ #include <condition_variable>
+ #include <atomic>
+ #include <functional>
++#if defined(ISAAC_FUNKEY)
++#include "mods.h"
++#include <zlib.h>
++#include <fcntl.h>
++#include <link.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ 
+ extern "C" __thread int plutovg_texture_smooth;
+ namespace fl {
+@@ -483,6 +491,212 @@ struct LeafRaster { std::vector<uint32_t> px; int w = 0, h = 0; uint64_t lastUse
+ struct LeafPlan { LeafKey key; DisplayObject* d; Mat mm; CX cx; bool hasCx; int bx, by, w, h, dx, dy; };
+ static std::unordered_map<LeafKey, LeafRaster*, LeafHash> g_leafCache;
+ static size_t g_leafBytes = 0; static uint64_t g_leafSeq = 0;
++static int leafSub() {   // (testing: ISAAC_LEAF_SUB, another fraction of a pixel)
++    static const int k = getenv("ISAAC_LEAF_SUB") ? std::max(1, atoi(getenv("ISAAC_LEAF_SUB"))) : 64;
++    return k;
++}
++
++#if defined(ISAAC_FUNKEY)
++// ------------------------------------------------------------ the pieces kept on the card (FunKey)
++// A room's floor and walls are drawn into its bitmap from 50-110 pieces, shapes with up to thousands of edges; the
++// first time a piece is seen it is parsed and rasterized, 1-3 ms each on the console: most of a room entry. So the
++// pieces rasterized are also written to saves/leaves_<SWF length>.data (zlib), each listed in .index (read at start),
++// and a piece drawn in an earlier room or session is read back from there instead. Its key holds no pointer: the
++// character's id and kind, the morph ratio, the matrix, the colour transform and the sub-pixel offset (dynamic text,
++// which changes, is left out). Both files are for one build of the program and one game file (in their header;
++// otherwise they start afresh), and only without mods (some change shapes). Up to 16 MB; a piece read back is checked
++// (key, CRC) and dropped if it doesn't match.
++namespace {
++struct DiskKey { uint16_t charId; uint8_t kind, pad; uint32_t variant; float a, b, c, d; float cx[8]; uint32_t fxy; };
++struct DiskHead { DiskKey key; uint16_t w, h; uint32_t len, crc; };   // in .data, before each piece's compressed pixels
++struct DiskFileHead { char magic[8]; uint32_t version, sub; uint8_t build[20]; uint32_t swfLen, which; };
++struct DiskSlot { uint64_t hash; uint32_t off, len; };                 // an entry of .index (hash 0: an empty slot)
++struct DiskQueued { DiskKey k; LeafRaster r; };   // a piece rasterized, to be written in idle time
++struct LeafDisk {
++    bool on = false, pending = false;
++    FILE* dataW = nullptr; FILE* indexW = nullptr; int dataR = -1;
++    uint64_t dataSize = 0; uint64_t maxBytes = 16u << 20;
++    std::vector<DiskSlot> tab; size_t count = 0;
++    std::vector<DiskQueued> queue; size_t queueBytes = 0, queueMax = 512u << 10;
++    uint64_t hits = 0, stored = 0, bad = 0, readBytes = 0, writeBytes = 0; double readMs = 0, writeMs = 0;
++} g_ld;
++uint64_t diskHash(const DiskKey& k) {
++    const uint8_t* p = (const uint8_t*)&k; uint64_t h = 1469598103934665603ull;
++    for (size_t i = 0; i < sizeof k; i++) { h ^= p[i]; h *= 1099511628211ull; }
++    return h ? h : 1;
++}
++DiskSlot* diskFind(uint64_t h) {
++    if (g_ld.tab.empty()) return nullptr;
++    size_t mask = g_ld.tab.size() - 1;
++    for (size_t i = h & mask;; i = (i + 1) & mask) { if (g_ld.tab[i].hash == h) return &g_ld.tab[i]; if (!g_ld.tab[i].hash) return nullptr; }
++}
++void diskInsert(const DiskSlot& e) {
++    if ((g_ld.count + 1) * 10 > g_ld.tab.size() * 7) {   // (load factor 0.7)
++        std::vector<DiskSlot> old; old.swap(g_ld.tab);
++        g_ld.tab.assign(std::max<size_t>(4096, old.size() * 2), DiskSlot{0, 0, 0}); g_ld.count = 0;
++        for (auto& o : old) if (o.hash) diskInsert(o);
++    }
++    size_t mask = g_ld.tab.size() - 1;
++    for (size_t i = e.hash & mask;; i = (i + 1) & mask) {
++        if (g_ld.tab[i].hash == e.hash) { g_ld.tab[i] = e; return; }
++        if (!g_ld.tab[i].hash) { g_ld.tab[i] = e; g_ld.count++; return; }
++    }
++}
++bool diskKeyOf(const LeafPlan& p, DiskKey& k) {
++    if (p.d->kind != OK_SHAPE && p.d->kind != OK_MORPH && p.d->kind != OK_TEXT) return false;
++    if ((const void*)g_movie.get(p.d->charId) != p.key.def) return false;   // (only the game file's own characters)
++    memset(&k, 0, sizeof k);
++    k.charId = p.d->charId; k.kind = (uint8_t)p.d->kind; k.variant = p.key.variant;
++    k.a = p.key.a; k.b = p.key.b; k.c = p.key.c; k.d = p.key.d; memcpy(k.cx, p.key.cx, sizeof k.cx); k.fxy = p.key.fxy;
++    return true;
++}
++// a piece listed in the index into r (its size checked by the caller); false if absent or not as written
++bool diskRead(const DiskKey& k, const DiskSlot& e, LeafRaster& r) {
++    auto t0 = std::chrono::steady_clock::now();
++    std::vector<uint8_t> buf(sizeof(DiskHead) + e.len);
++    bool ok = pread(g_ld.dataR, buf.data(), buf.size(), (off_t)e.off) == (ssize_t)buf.size();
++    DiskHead h; if (ok) memcpy(&h, buf.data(), sizeof h);
++    ok = ok && !memcmp(&h.key, &k, sizeof k) && h.len == e.len && h.w && h.h &&
++         (uint32_t)crc32(0, buf.data() + sizeof h, e.len) == h.crc;
++    if (ok) {
++        r.px.resize((size_t)h.w * h.h); uLongf n = (uLongf)(r.px.size() * 4);
++        ok = uncompress((Bytef*)r.px.data(), &n, buf.data() + sizeof h, e.len) == Z_OK && n == r.px.size() * 4;
++        r.w = h.w; r.h = h.h;
++    }
++    g_ld.readMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    g_ld.readBytes += buf.size();
++    return ok;
++}
++void diskWrite(const DiskKey& k, const LeafRaster& r) {
++    if (r.w <= 0 || r.h <= 0 || r.w > 65535 || r.h > 65535) return;
++    auto t0 = std::chrono::steady_clock::now();
++    uLongf n = compressBound((uLong)(r.px.size() * 4));
++    std::vector<uint8_t> z(n);
++    if (compress2(z.data(), &n, (const Bytef*)r.px.data(), (uLong)(r.px.size() * 4), 1) != Z_OK) return;
++    DiskHead h; memset(&h, 0, sizeof h); h.key = k; h.w = (uint16_t)r.w; h.h = (uint16_t)r.h; h.len = (uint32_t)n;
++    h.crc = (uint32_t)crc32(0, z.data(), (uInt)n);
++    if (g_ld.dataSize + sizeof h + n > g_ld.maxBytes) return;   // (full: what is there is still read)
++    DiskSlot e{diskHash(k), (uint32_t)g_ld.dataSize, (uint32_t)n};
++    if (fwrite(&h, sizeof h, 1, g_ld.dataW) != 1 || fwrite(z.data(), 1, n, g_ld.dataW) != n) { g_ld.on = false; return; }
++    if (fwrite(&e, sizeof e, 1, g_ld.indexW) != 1) { g_ld.on = false; return; }
++    g_ld.dataSize += sizeof h + n; diskInsert(e); g_ld.pending = true;
++    g_ld.stored++; g_ld.writeBytes += sizeof h + n;
++    g_ld.writeMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++}
++void diskFlush() {   // after pieces were written: the pixels first, then their index entries
++    if (!g_ld.pending) return;
++    fflush(g_ld.dataW); fflush(g_ld.indexW); g_ld.pending = false;
++}
++// a piece rasterized now: written later, in the time between ticks (leafDiskIdle), so that the room's entry doesn't
++// wait for its compression; at once if the queue is full (512 KB of pixels)
++void diskQueue(const DiskKey& k, const LeafRaster& r) {
++    size_t b = r.px.size() * 4;
++    if (g_ld.queueBytes + b > g_ld.queueMax) { diskWrite(k, r); diskFlush(); return; }
++    g_ld.queue.push_back({k, r}); g_ld.queueBytes += b;
++}
++// the missing pieces that are on the card: out[i] set for those read
++void diskFetch(const std::vector<const LeafPlan*>& miss, std::vector<LeafRaster*>& out) {
++    struct Want { size_t i; DiskKey k; DiskSlot e; };
++    std::vector<Want> want;
++    for (size_t i = 0; i < miss.size(); i++) {
++        Want w; w.i = i;
++        if (!diskKeyOf(*miss[i], w.k)) continue;
++        if (DiskSlot* e = diskFind(diskHash(w.k))) if (e->len) { w.e = *e; want.push_back(w); }
++    }
++    std::sort(want.begin(), want.end(), [](const Want& a, const Want& b) { return a.e.off < b.e.off; });   // (in file order)
++    for (auto& w : want) {
++        LeafRaster* r = new LeafRaster();
++        if (diskRead(w.k, w.e, *r) && r->w == miss[w.i]->w && r->h == miss[w.i]->h) { out[w.i] = r; g_ld.hits++; }
++        else { delete r; g_ld.bad++; if (DiskSlot* e = diskFind(w.e.hash)) e->len = 0; }   // (not used again: rasterized)
++    }
++}
++bool diskReadHead(FILE* f, const DiskFileHead& want) {
++    DiskFileHead h; return f && fread(&h, sizeof h, 1, f) == 1 && !memcmp(&h, &want, sizeof h);
++}
++// this build of the program: the linker's build ID (NT_GNU_BUILD_ID, -Wl,--build-id), else the program file's size
++// and time
++void buildIdentity(uint8_t out[20]) {
++    memset(out, 0, 20);
++    dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {   // (the program itself comes first)
++        for (int i = 0; i < info->dlpi_phnum; i++) {
++            const auto& ph = info->dlpi_phdr[i];
++            if (ph.p_type != PT_NOTE) continue;
++            const char* p = (const char*)(info->dlpi_addr + ph.p_vaddr); const char* e = p + ph.p_memsz;
++            while (p + 12 <= e) {
++                uint32_t nsz, dsz, type; memcpy(&nsz, p, 4); memcpy(&dsz, p + 4, 4); memcpy(&type, p + 8, 4);
++                const char* name = p + 12; const char* desc = name + ((nsz + 3) & ~3u);
++                if (desc + dsz > e) break;
++                if (type == 3 && nsz == 4 && !memcmp(name, "GNU", 4) && dsz) { memcpy(data, desc, std::min<uint32_t>(dsz, 20)); return 1; }
++                p = desc + ((dsz + 3) & ~3u);
++            }
++        }
++        return 1;
++    }, out);
++    static const uint8_t zero[20] = {};
++    if (memcmp(out, zero, 20)) return;
++    struct stat st;
++    if (stat("/proc/self/exe", &st) == 0) { uint64_t a = (uint64_t)st.st_size, b = (uint64_t)st.st_mtime; memcpy(out, &a, 8); memcpy(out + 8, &b, 8); }
++}
++}  // namespace
++
++void leafDiskOpen(const std::string& dir, uint32_t swfLen) {
++    if (getenv("ISAAC_NO_LEAFDISK")) { logf("[leafdisk] off (ISAAC_NO_LEAFDISK)\n"); return; }
++    for (auto& m : modsAll()) if (m.enabled) { logf("[leafdisk] off: mods are on (some change shapes)\n"); return; }
++    DiskFileHead want; memset(&want, 0, sizeof want);
++    memcpy(want.magic, "ISAACLV1", 8); want.version = 1; want.sub = (uint32_t)leafSub(); want.swfLen = swfLen;
++    buildIdentity(want.build);
++    struct stat st;
++    const std::string base = dir + "leaves_" + std::to_string(swfLen), dp = base + ".data", ip = base + ".index";
++    DiskFileHead wantI = want; wantI.which = 1;
++    uint64_t dataSize = stat(dp.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
++    bool keep = false; std::vector<DiskSlot> entries;
++    {
++        FILE* d = fopen(dp.c_str(), "rb"); FILE* x = fopen(ip.c_str(), "rb");
++        keep = diskReadHead(d, want) && diskReadHead(x, wantI);
++        if (keep) { DiskSlot e; while (fread(&e, sizeof e, 1, x) == 1) if (e.hash && (uint64_t)e.off + sizeof(DiskHead) + e.len <= dataSize) entries.push_back(e); }
++        if (d) fclose(d); if (x) fclose(x);
++    }
++    if (!keep) {   // another build or game, or none yet: afresh
++        remove(dp.c_str()); remove(ip.c_str());
++        FILE* d = fopen(dp.c_str(), "wb"); FILE* x = fopen(ip.c_str(), "wb");
++        bool ok = d && x && fwrite(&want, sizeof want, 1, d) == 1 && fwrite(&wantI, sizeof wantI, 1, x) == 1;
++        if (d) fclose(d); if (x) fclose(x);
++        if (!ok) { logf("[leafdisk] off: cannot write %s\n", dp.c_str()); return; }
++        dataSize = sizeof want;
++    }
++    g_ld.dataW = fopen(dp.c_str(), "ab"); g_ld.indexW = fopen(ip.c_str(), "ab"); g_ld.dataR = open(dp.c_str(), O_RDONLY | O_CLOEXEC);
++    if (!g_ld.dataW || !g_ld.indexW || g_ld.dataR < 0) { logf("[leafdisk] off: cannot open %s\n", dp.c_str()); return; }
++    setvbuf(g_ld.dataW, nullptr, _IOFBF, 64 << 10);
++    g_ld.dataSize = dataSize;
++    for (auto& e : entries) diskInsert(e);
++    g_ld.on = true;
++    logf("[leafdisk] %s: %zu pieces, %.1f MB%s\n", dp.c_str(), g_ld.count, dataSize / 1048576.0, keep ? "" : " (new)");
++}
++uint64_t leafDiskHits() { return g_ld.hits; }   // (diagnostics: pieces read back so far)
++bool leafDiskBusy() { return !g_ld.queue.empty(); }
++// pieces waiting to be written, for up to budgetMs (the time left before the next tick; at the end, all)
++void leafDiskIdle(double budgetMs) {
++    if (g_ld.queue.empty()) return;
++    auto t0 = std::chrono::steady_clock::now();
++    size_t n = 0;
++    while (n < g_ld.queue.size()) {
++        const DiskQueued& q = g_ld.queue[n++];
++        if (g_ld.on) diskWrite(q.k, q.r);
++        g_ld.queueBytes -= std::min(g_ld.queueBytes, q.r.px.size() * 4);
++        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() >= budgetMs) break;
++    }
++    g_ld.queue.erase(g_ld.queue.begin(), g_ld.queue.begin() + n);
++    if (g_ld.queue.empty()) std::vector<DiskQueued>().swap(g_ld.queue);
++    diskFlush();
++}
++std::string leafDiskStats() {
++    char b[256];
++    snprintf(b, sizeof b, "pieces from the card %llu (%.0f KB in %.0f ms), stored %llu (%.0f KB in %.0f ms), bad %llu; %zu on the card (%.1f MB)",
++             (unsigned long long)g_ld.hits, g_ld.readBytes / 1024.0, g_ld.readMs, (unsigned long long)g_ld.stored, g_ld.writeBytes / 1024.0, g_ld.writeMs,
++             (unsigned long long)g_ld.bad, g_ld.count, g_ld.dataSize / 1048576.0);
++    return g_ld.on ? std::string(b) : std::string("off");
++}
++#endif
+ 
+ struct DrawCtx {
+     bool collect = false; int clip = 0; BitmapData* bd = nullptr;
+@@ -522,7 +736,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
+     if (!leafIdent(d, def, variant)) return false;
+     RectF b; if (!contentBounds(d, b) || !b.valid()) return false;
+     double ftx = std::floor(m.tx), fty = std::floor(m.ty);
+-    static const int kSub = getenv("ISAAC_LEAF_SUB") ? std::max(1, atoi(getenv("ISAAC_LEAF_SUB"))) : 64;   // subpixel quantized to 1/64 px
++    const int kSub = leafSub();   // subpixel quantized to 1/64 px
+     int fx = (int)std::lround((m.tx - ftx) * kSub), fy = (int)std::lround((m.ty - fty) * kSub);
+     if (fx >= kSub) { fx = 0; ftx += 1; } if (fy >= kSub) { fy = 0; fty += 1; }
+     Mat mm = m; mm.tx = (double)fx / kSub; mm.ty = (double)fy / kSub;
+@@ -742,12 +956,20 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+     if (!miss.empty()) {
+         auto tr0 = std::chrono::steady_clock::now();
+         struct AddMs { std::chrono::steady_clock::time_point t; ~AddMs() { g_leafRasterMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } } addMs{tr0};
+-        std::vector<LeafRaster*> out(miss.size());
++        std::vector<LeafRaster*> out(miss.size(), nullptr);
++#if defined(ISAAC_FUNKEY)
++        if (g_ld.on) diskFetch(miss, out);   // (the pieces drawn before, on the card)
++        std::vector<uint8_t> drawnNow(miss.size(), 0);
++#endif
+         struct Job { int leaf, y0, y1; size_t cost; };
+         std::vector<Job> jobs;
+         int nt = rasterThreads() + 1;
+         for (size_t i = 0; i < miss.size(); i++) {
++            if (out[i]) continue;
+             const LeafPlan& p = *miss[i];
++#if defined(ISAAC_FUNKEY)
++            drawnNow[i] = 1;
++#endif
+             LeafRaster* r = out[i] = new LeafRaster(); r->w = p.w; r->h = p.h; r->px.assign((size_t)p.w * p.h, 0);
+             int bands = 1;
+             if (nt > 1 && (size_t)p.w * p.h > 150000) bands = std::max(1, std::min(nt * 2, p.h / 48));
+@@ -758,6 +980,12 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+         static const int repeat = getenv("ISAAC_LEAF_REPEAT") ? atoi(getenv("ISAAC_LEAF_REPEAT")) : 0;   // (profiling: the same work again)
+         for (int k = 0; k < repeat; k++)
+             for (const Job& jb : jobs) { LeafRaster tmp; const LeafPlan& p = *miss[jb.leaf]; tmp.w = p.w; tmp.h = p.h; tmp.px.assign((size_t)p.w * p.h, 0); rasterLeafRows(p, &tmp, jb.y0, jb.y1); }
++#if defined(ISAAC_FUNKEY)
++        if (g_ld.on) {   // the pieces rasterized now, onto the card (in idle time)
++            DiskKey k;
++            for (size_t i = 0; i < miss.size(); i++) if (drawnNow[i] && diskKeyOf(*miss[i], k)) diskQueue(k, *out[i]);
++        }
++#endif
+         for (size_t i = 0; i < miss.size(); i++) { out[i]->lastUse = g_leafSeq; g_leafBytes += out[i]->px.size() * 4; g_leafCache[miss[i]->key] = out[i]; }
+     }
+     uint64_t t1 = prof ? SDL_GetPerformanceCounter() : 0;

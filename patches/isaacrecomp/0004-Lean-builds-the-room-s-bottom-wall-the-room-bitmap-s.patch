@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Fri, 30 Oct 2026 23:01:07 -0400
+Subject: [PATCH] Lean builds: the room's bottom wall (the room bitmap sized
+ for the HUD at the room scale)
+
+The game makes the room's background bitmap gridxs x (gridys - 75) pixels, 75 being the HUD's height in game
+units: right at its own scale 1 (hdx = 1), with spare rows at its higher tiers. With gen.py --room-scale below 1
+(genpsp/: 0.566667, the PSP's and the FunKey's builds) the bitmap ended 57 units above the stage's bottom, so the
+bottom wall was cut off and a flat band of the stage's colour showed there, the bottom door drawn over it. The
+BitmapData constructor now gives that bitmap 75 * hdx pixels for the HUD (364x197 -> 364x230). Only that bitmap
+matches (hdx < 1, gridxs x (gridys - 75)); nothing in the game reads its size, and the logic is unchanged.
+---
+ rt/builtins.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/rt/builtins.cpp b/rt/builtins.cpp
+index 369a02d..c2a7914 100644
+--- a/rt/builtins.cpp
++++ b/rt/builtins.cpp
+@@ -367,9 +367,26 @@ static uint32_t unpremul(uint32_t p) {
+     uint32_t r = std::min<uint32_t>(255u, ((p >> 16) & 255) * 255 / a), g = std::min<uint32_t>(255u, ((p >> 8) & 255) * 255 / a), b = std::min<uint32_t>(255u, (p & 255) * 255 / a);
+     return a << 24 | r << 16 | g << 8 | b;
+ }
++// Room layers made smaller than the game's own lowest quality (gen.py --room-scale, genpsp/: hdx 0.566667): the game
++// makes the room's background bitmap gridxs x (gridys - 75) pixels, 75 being the HUD's height in game units, which
++// is right only at its scale 1 (hdx = 1; larger scales leave spare rows). Below 1 the bitmap ends 75 * (1/hdx - 1)
++// units above the stage's bottom (57 at 0.566667): the bottom wall was cut off and a flat band of the stage's colour
++// showed there, with only the bottom door drawn over it. That bitmap gets 75 * hdx pixels for the HUD instead.
++static int roomLayerHeight(int w, int h) {
++    static Str* sA = intern("a"); static Str* sHdx = intern("hdx"); static Str* sGx = intern("gridxs"); static Str* sGy = intern("gridys");
++    if (h >= w || !vm.root) return h;   // (the room layer is wider than tall)
++    Value a = getMemK(Value((Object*)vm.root), sA);
++    if (!a.isObj()) return h;
++    double hdx = toNum(getMemK(a, sHdx)), gx = toNum(getMemK(a, sGx)), gy = toNum(getMemK(a, sGy));
++    if (!(hdx > 0 && hdx < 1) || w != (int)gx || h != (int)gy - 75) return h;
++    int fixed = (int)std::ceil(gy - 75 * hdx);
++    logf("room layer: %dx%d made %dx%d (the HUD's 75 units at scale %g)\n", w, h, w, fixed, hdx);
++    return fixed;
++}
+ static Value bd_ctor(Act&, Value, int argc, Value* argv) {
+     BitmapData* b = gcNew<BitmapData>(); b->proto = protos::bitmapdata;
+     b->w = std::max(0, std::min(8191, toInt32(arg(argc, argv, 0)))); b->h = std::max(0, std::min(8191, toInt32(arg(argc, argv, 1))));
++    b->h = roomLayerHeight(b->w, b->h);
+     b->transparent = argc > 2 ? truthy(argv[2]) : true;
+     uint32_t fill = argc > 3 ? (uint32_t)toInt32(argv[3]) : 0xffffffffu;
+     if (!b->transparent) fill |= 0xff000000u;

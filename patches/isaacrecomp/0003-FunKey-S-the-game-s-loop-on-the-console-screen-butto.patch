@@ -1,0 +1,837 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Fri, 30 Oct 2026 21:21:25 -0400
+Subject: [PATCH] FunKey S: the game's loop on the console (screen, buttons,
+ sound, power-off)
+
+rt/funkey.cpp (ISAAC_FUNKEY builds): main.cpp's play loop on one thread, 30 ticks a second on a fixed clock,
+pictures skipped (never the logic) when behind; /dev/fb0 in RGB565 with a pan per picture; the button daemon's
+keys mapped to the game's (Menu twice quits); FunKey-OS's power-off signal handled on a thread of its own, the save
+written before powering off; the notification overlay for messages; a speed and memory line every 5 s. Test hooks:
+ISAAC_FUNKEY_SCRIPT (a headless test script played with the real loop), ISAAC_FUNKEY_MEMLOG, ISAAC_HOME.
+
+Sound: the FunKey's speaker is the right channel only, so the mix goes there as (L+R)/2.
+
+Memory: lossless bitmaps over 1024 pixels a side are decoded shrunk (box-averaged by a power of 2, in strips; the
+Eternal Edition's 3000x3000 light becomes 750x750), the fill matrix scaled to match: startup peak 92 MB -> 27 MB.
+Decoded SWF bitmaps trimmed to 4 MB. Still graphics over 1.5x the canvas's area rasterized at their transform.
+---
+ CMakeLists.txt     |   4 +-
+ rt/audio.cpp       |  11 +-
+ rt/funkey.cpp      | 509 +++++++++++++++++++++++++++++++++++++++++++++
+ rt/main.cpp        |  27 ++-
+ rt/raster.cpp      |   9 +-
+ rt/render_soft.cpp |   4 +-
+ rt/swfdata.h       |   1 +
+ rt/swfload.cpp     |  60 ++++++
+ 8 files changed, 617 insertions(+), 8 deletions(-)
+ create mode 100644 rt/funkey.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9ba62b0..954e6e3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -158,9 +158,9 @@ if(PSP)   # own main loop and sceGu renderer
+   list(REMOVE_ITEM RT_SRC rt/render.cpp rt/main.cpp rt/touch.cpp)
+   list(APPEND RT_SRC rt/render_psp.cpp rt/main_psp.cpp)
+ endif()
+-if(ISAAC_FUNKEY)   # no GPU: the software renderer (it builds on PC too, for testing)
++if(ISAAC_FUNKEY)   # no GPU: the software renderer (it builds on PC too, for testing), and the console's loop
+   list(REMOVE_ITEM RT_SRC rt/render.cpp)
+-  list(APPEND RT_SRC rt/render_soft.cpp)
++  list(APPEND RT_SRC rt/render_soft.cpp rt/funkey.cpp)
+ endif()
+ # lean SWF loading (PSP; on PC for testing): the SWF is decompressed to a cache file, sounds read from it on demand,
+ # shapes parsed when first drawn
+diff --git a/rt/audio.cpp b/rt/audio.cpp
+index 91c8c2f..8871d81 100644
+--- a/rt/audio.cpp
++++ b/rt/audio.cpp
+@@ -178,7 +178,8 @@ static bool refill(Chan& c) {
+     return true;
+ }
+ 
+-static void mix(void*, Uint8* stream, int len) {
++static void mix(void* userdata, Uint8* stream, int len) {
++    (void)userdata;
+ #ifdef __PSP__
+     // (PSP: 16-bit output: mixed in floats here, converted at the end instead of by SDL)
+     static float s_mix[4096 * 2];
+@@ -257,6 +258,11 @@ static void mix(void*, Uint8* stream, int len) {
+ #else
+     for (int i = 0; i < frames * 2; i++) out[i] = std::max(-1.f, std::min(1.f, out[i]));
+ #endif
++#ifdef ISAAC_FUNKEY
++    // The FunKey's speaker is on the right channel only, and FunKey-OS's default ALSA route adds left and right into
++    // it (which clips): (L + R) / 2 on the right, nothing on the left. (Found in my other FunKey S projects.)
++    if (userdata) for (int i = 0; i < frames; i++) { out[i * 2 + 1] = (out[i * 2] + out[i * 2 + 1]) * 0.5f; out[i * 2] = 0.f; }
++#endif
+ }
+ 
+ // ---- output device
+@@ -300,6 +306,9 @@ static bool openDevice(const std::string& name) {
+     SDL_AudioSpec want{}, have{};
+     // mix directly at the device's rate (one resampling step instead of ours + SDL's conversion)
+     want.freq = (kIsAndroid || kIsSwitch) ? 48000 : kRate; want.format = kIsPsp ? AUDIO_S16SYS : AUDIO_F32SYS; want.channels = 2; want.samples = kIsAndroid ? 512 : 1024; want.callback = mix;   // (Android: ~11 ms)
++#ifdef ISAAC_FUNKEY
++    static int s_speaker = 1; want.userdata = &s_speaker;   // (the device's mix goes to the FunKey's speaker: see mix())
++#endif
+     SDL_AudioDeviceID d = SDL_OpenAudioDevice(name.empty() ? nullptr : name.c_str(), 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+     if (!d) { logf("audio: %s: %s\n", name.empty() ? "default device" : name.c_str(), SDL_GetError()); return false; }
+     if (have.freq >= 8000 && have.freq <= 192000) g_rate = have.freq;
+diff --git a/rt/funkey.cpp b/rt/funkey.cpp
+new file mode 100644
+index 0000000..4f2a364
+--- /dev/null
++++ b/rt/funkey.cpp
+@@ -0,0 +1,509 @@
++// SPDX-License-Identifier: MIT
++// FunKey S (ISAAC_FUNKEY builds): the game's loop on one thread, and what surrounds it on the console. main.cpp calls
++// funkeyEarly() first thing, funkeyPlay() in place of its threaded loop (not for --headless tests), and funkeyFinish()
++// once the save is written.
++// - The loop: buttons -> one logic tick -> (the picture: snapshot, draw, present) -> collector, 30 ticks a second on a
++//   fixed clock. When a tick and its picture take longer than 1/30 s, the next pictures are skipped (never the
++//   logic) until the clock is caught up, so the game keeps its speed; at least every 4th picture is drawn, and after
++//   a long stall (a room being built) the clock is reset rather than caught up.
++// - Screen: /dev/fb0, 240x240 RGB565 over SPI (fbtft). Only one page is backed (the driver reports more), and
++//   FBIOPAN_DISPLAY after each picture hands it over so the driver sends new pictures only (it returns an error
++//   anyway); a picture is handed over again every 0.1 s when none is new. The text console is switched to graphics
++//   with its keyboard off while the game runs.
++// - Buttons: the button daemon's virtual keyboard (the /dev/input device with KEY_A and KEY_Q).
++// - Power-off: FunKey-OS's `powerdown schedule 0.1` sends SIGUSR1 to the PID the launcher recorded and powers off 0.1 s
++//   later. A thread of its own takes the signal at once (the loop may be inside a room build): it ends the scheduled
++//   power-off, starts `powerdown handle` and shows "Shutting down..."; the loop stops, main.cpp writes the save, and
++//   funkeyFinish() runs `powerdown now`. If that hasn't happened 2.5 s after the signal (the lid cuts the power at 3 s),
++//   the thread powers off itself.
++// - Messages through the display driver's notification overlay (8x8 font, '^' starts a line).
++// The console's facts and timings come from my other FunKey S projects; this file is written for this game.
++//
++// Testing: ISAAC_FUNKEY_SCRIPT=<file> plays a headless test script (tools: "<tick> down|up <code>", "click x y",
++// "eval ...", "shot file", "quit") instead of the buttons, with the game's random numbers fixed; ISAAC_TICKMARKS=1
++// writes "OFKMEM" lines per tick and per picture (scripts/measure/tick-cost.py); ISAAC_FUNKEY_NO_POWEROFF=1 never
++// runs powerdown (a SIGUSR1 then only saves and quits).
++#ifdef ISAAC_FUNKEY
++#include "display.h"
++#include "snapshot.h"
++#include "render.h"
++#include "menuui.h"
++#include "mods.h"
++#include "core.h"
++#include <fcntl.h>
++#include <linux/fb.h>
++#include <linux/input.h>
++#include <linux/kd.h>
++#include <poll.h>
++#include <pthread.h>
++#include <signal.h>
++#include <spawn.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <termios.h>
++#include <ucontext.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <cmath>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++extern char** environ;
++
++namespace fl {
++void runIntervals(); void recompPatchesTick(); bool recompInGameplay(bool* inGame);
++void debugEval(const std::string&);
++extern uint32_t g_shapeTick; void rasterTrim(size_t budget);
++const uint32_t* renderSoftOutput(int* w, int* h);
++void leanStats(size_t* shapeBytes, size_t* soundBytes); void renderMemStats(size_t* pages, size_t* bitmaps);
++
++namespace {
++double now() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
++double threadCpuMs() { timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
++// a log line written at once (the signal thread must not wait on stdio's lock)
++void rawLog(const char* fmt, ...) {
++    char line[512]; va_list ap; va_start(ap, fmt); int n = vsnprintf(line, sizeof line - 1, fmt, ap); va_end(ap);
++    if (n < 0) return;
++    if (n > (int)sizeof line - 2) n = (int)sizeof line - 2;
++    line[n++] = '\n';
++    if (write(STDERR_FILENO, line, n) < 0) {}
++}
++
++// ---------------------------------------------------------------- the text console
++int g_ttyMode = -1, g_kbMode = -1;
++void takeConsole() {
++    int fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
++    if (fd < 0) return;
++    if (ioctl(fd, KDGETMODE, &g_ttyMode) != 0) g_ttyMode = KD_TEXT;
++    if (ioctl(fd, KDGKBMODE, &g_kbMode) != 0) g_kbMode = -1;
++    ioctl(fd, KDSETMODE, KD_GRAPHICS);   // (no cursor, no console text over the picture)
++    if (g_kbMode >= 0 && g_kbMode != K_OFF) ioctl(fd, KDSKBMODE, K_OFF);   // (the buttons don't type into it)
++    close(fd);
++}
++void restoreConsole() {   // (async-signal-safe: the crash handler calls it)
++    if (g_ttyMode < 0) return;
++    int fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
++    if (fd < 0) return;
++    if (g_kbMode >= 0 && g_kbMode != K_OFF) ioctl(fd, KDSKBMODE, g_kbMode);
++    ioctl(fd, KDSETMODE, g_ttyMode);
++    tcflush(fd, TCIFLUSH);   // (whatever was typed into it meanwhile)
++    close(fd);
++    g_ttyMode = -1;
++}
++
++// ---------------------------------------------------------------- the screen
++struct Fb { int fd = -1; uint8_t* mem = nullptr; size_t size = 0; int w = 0, h = 0, bpp = 0, line = 0; double panned = 0; } g_fb;
++std::string g_notification;   // the driver's overlay (sysfs), "" if none
++bool fbOpen(std::string& desc) {
++    const char* path = getenv("ISAAC_FUNKEY_FB") ? getenv("ISAAC_FUNKEY_FB") : "/dev/fb0";
++    g_fb.fd = open(path, O_RDWR | O_CLOEXEC);
++    if (g_fb.fd < 0) { desc = std::string("no screen: ") + path + ": " + strerror(errno); return false; }
++    fb_var_screeninfo var; fb_fix_screeninfo fix;
++    if (ioctl(g_fb.fd, FBIOGET_VSCREENINFO, &var) != 0 || ioctl(g_fb.fd, FBIOGET_FSCREENINFO, &fix) != 0) {
++        desc = std::string(path) + " is not a framebuffer"; close(g_fb.fd); g_fb.fd = -1; return false;
++    }
++    bool rgb565 = var.bits_per_pixel == 16 && var.red.offset == 11 && var.green.offset == 5;
++    bool xrgb = var.bits_per_pixel == 32 && var.red.offset == 16 && var.green.offset == 8;
++    if (!rgb565 && !xrgb) { desc = std::string(path) + ": unsupported pixel format"; close(g_fb.fd); g_fb.fd = -1; return false; }
++    g_fb.w = (int)var.xres; g_fb.h = (int)var.yres; g_fb.bpp = (int)var.bits_per_pixel; g_fb.line = (int)fix.line_length;
++    // one page only: fbtft reports more memory than it backs, and the first access past one frame is a SIGBUS
++    g_fb.size = (size_t)g_fb.line * g_fb.h;
++    void* m = mmap(nullptr, g_fb.size, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb.fd, 0);
++    if (m == MAP_FAILED) { desc = std::string("cannot map ") + path; close(g_fb.fd); g_fb.fd = -1; return false; }
++    g_fb.mem = (uint8_t*)m;
++    memset(g_fb.mem, 0, g_fb.size);
++    const char* name = strrchr(path, '/');
++    g_notification = std::string("/sys/class/graphics/") + (name ? name + 1 : path) + "/notification";
++    if (access(g_notification.c_str(), W_OK) != 0) g_notification.clear();
++    char b[160]; snprintf(b, sizeof b, "%s: %dx%d, %d bits per pixel, line %d bytes%s", path, g_fb.w, g_fb.h, g_fb.bpp, g_fb.line,
++                          g_notification.empty() ? "" : ", notification overlay");
++    desc = b;
++    return true;
++}
++void fbPan() {
++    if (g_fb.fd < 0) return;
++    fb_var_screeninfo var;
++    if (ioctl(g_fb.fd, FBIOGET_VSCREENINFO, &var) != 0) return;
++    var.xoffset = 0; var.yoffset = 0;
++    if (ioctl(g_fb.fd, FBIOPAN_DISPLAY, &var) != 0) {}   // (fbtft takes the picture and answers ENODEV: nothing to check)
++    g_fb.panned = now();
++}
++void fbKeepShown() { if (g_fb.mem && now() - g_fb.panned >= 0.1) fbPan(); }   // (within the driver's 1/9 s)
++// The output frame (ARGB) onto the screen, in RGB565 with a 4x4 ordered dither (the stage's dark gradients would show
++// bands otherwise)
++void fbPresent(const uint32_t* px, int w, int h) {
++    if (!g_fb.mem || !px) return;
++    static const uint8_t kBayer[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
++    int cw = std::min(w, g_fb.w), ch = std::min(h, g_fb.h);
++    for (int y = 0; y < ch; y++) {
++        const uint32_t* s = px + (size_t)y * w;
++        if (g_fb.bpp == 16) {
++            uint16_t* d = (uint16_t*)(g_fb.mem + (size_t)y * g_fb.line);
++            const uint8_t* bay = kBayer[y & 3];
++            for (int x = 0; x < cw; x++) {
++                uint32_t c = s[x], t = bay[x & 3];
++                uint32_t r = ((c >> 16) & 255) + (t >> 1), g = ((c >> 8) & 255) + (t >> 2), b = (c & 255) + (t >> 1);
++                if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
++                d[x] = (uint16_t)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
++            }
++        } else memcpy(g_fb.mem + (size_t)y * g_fb.line, s, (size_t)cw * 4);
++    }
++    fbPan();
++}
++void notify(const std::string& text) {   // "" clears it
++    if (g_notification.empty()) return;
++    int fd = open(g_notification.c_str(), O_WRONLY | O_CLOEXEC);
++    if (fd < 0) return;
++    std::string t = text.empty() ? std::string("clear") : text.substr(0, 400);
++    if (write(fd, t.data(), t.size()) < 0) {}
++    close(fd);
++    fbPan();   // (the driver draws the overlay into each picture it's handed)
++}
++
++// ---------------------------------------------------------------- the buttons
++enum Btn { B_UP, B_DOWN, B_LEFT, B_RIGHT, B_A, B_B, B_X, B_Y, B_L, B_R, B_START, B_FN, B_MENU, B_COUNT };
++std::vector<int> g_inputFds;
++std::string inputOpen() {
++    std::string desc;
++    for (int i = 0; i < 32; i++) {
++        char path[32]; snprintf(path, sizeof path, "/dev/input/event%d", i);
++        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++        if (fd < 0) continue;
++        unsigned long bits[KEY_MAX / (8 * sizeof(unsigned long)) + 1] = {};
++        auto has = [&](int code) { return (bits[code / (8 * sizeof(unsigned long))] >> (code % (8 * sizeof(unsigned long)))) & 1; };
++        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof bits), bits) < 0 || !has(KEY_A) || !has(KEY_Q)) { close(fd); continue; }
++        char name[128] = "?"; ioctl(fd, EVIOCGNAME(sizeof name), name);
++        desc += (desc.empty() ? "" : ", ") + std::string(path) + " (" + name + ")";
++        g_inputFds.push_back(fd);
++    }
++    return desc.empty() ? std::string("no buttons found") : desc;
++}
++int buttonOf(int code) {   // the button daemon's keys (fkgpiod.conf)
++    switch (code) {
++        case KEY_U: return B_UP; case KEY_D: return B_DOWN; case KEY_L: return B_LEFT; case KEY_R: return B_RIGHT;
++        case KEY_A: return B_A; case KEY_B: return B_B; case KEY_X: return B_X; case KEY_Y: return B_Y;
++        case KEY_M: return B_L; case KEY_N: return B_R; case KEY_S: return B_START; case KEY_K: return B_FN; case KEY_Q: return B_MENU;
++        default: return -1;
++    }
++}
++// calls f(button, down) for each press and release (auto-repeats ignored)
++template <class F> void inputPoll(F&& f) {
++    for (int fd : g_inputFds) {
++        input_event ev[32];
++        for (;;) {
++            ssize_t n = read(fd, ev, sizeof ev);
++            if (n < (ssize_t)sizeof(input_event)) break;
++            for (int i = 0; i < (int)(n / sizeof(input_event)); i++) {
++                if (ev[i].type != EV_KEY || ev[i].value == 2) continue;
++                int b = buttonOf(ev[i].code);
++                if (b >= 0) f(b, ev[i].value == 1);
++            }
++        }
++    }
++}
++void inputWait(double seconds) {   // sleep, waking early when a button changes
++    if (seconds <= 0) return;
++    std::vector<pollfd> p;
++    for (int fd : g_inputFds) p.push_back({fd, POLLIN, 0});
++    if (p.empty()) { timespec ts{(time_t)seconds, (long)((seconds - (time_t)seconds) * 1e9)}; nanosleep(&ts, nullptr); return; }
++    poll(p.data(), p.size(), (int)std::ceil(seconds * 1000));
++}
++
++// ---------------------------------------------------------------- signals: stop, power-off, crashes
++std::atomic<bool> g_stopReq{false}, g_powerReq{false}, g_powerDone{false};
++const char* kPowerdown = "/usr/local/sbin/powerdown";
++bool takeOver() { return !getenv("ISAAC_FUNKEY_NO_POWEROFF") && access(kPowerdown, X_OK) == 0; }
++pid_t spawn(const char* prog, const char* a1) {
++    const char* argv[] = {prog, a1, nullptr};
++    posix_spawnattr_t attr; posix_spawnattr_init(&attr);
++    sigset_t none, defaults; sigemptyset(&none); sigemptyset(&defaults);
++    for (int s : {SIGUSR1, SIGTERM, SIGINT, SIGHUP, SIGPIPE}) sigaddset(&defaults, s);
++    posix_spawnattr_setsigmask(&attr, &none); posix_spawnattr_setsigdefault(&attr, &defaults);
++    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
++    pid_t pid = -1;
++    if (posix_spawn(&pid, prog, nullptr, &attr, (char* const*)argv, environ) != 0) pid = -1;
++    posix_spawnattr_destroy(&attr);
++    return pid;
++}
++// the power-offs FunKey-OS has scheduled (`powerdown schedule 0.1`: a shell script sleeping before `powerdown now`)
++int killScheduled() {
++    int killed = 0;
++    DIR* d = opendir("/proc");
++    if (!d) return 0;
++    while (dirent* e = readdir(d)) {
++        int pid = atoi(e->d_name);
++        if (pid <= 1 || pid == getpid()) continue;
++        char path[64], cmd[512]; snprintf(path, sizeof path, "/proc/%d/cmdline", pid);
++        int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) continue;
++        ssize_t n = read(fd, cmd, sizeof cmd - 1); close(fd);
++        if (n <= 0) continue;
++        for (ssize_t i = 0; i < n; i++) if (!cmd[i]) cmd[i] = ' ';
++        cmd[n] = 0;
++        if (strstr(cmd, "powerdown schedule") && kill(pid, SIGTERM) == 0) killed++;
++    }
++    closedir(d);
++    return killed;
++}
++void powerOffNow() {   // never returns on the console
++    restoreConsole();
++    sync();
++    if (takeOver()) { const char* argv[] = {kPowerdown, "now", nullptr}; execv(kPowerdown, (char* const*)argv); }
++    _exit(0);
++}
++sigset_t stopSignals() { sigset_t s; sigemptyset(&s); for (int x : {SIGUSR1, SIGTERM, SIGINT, SIGHUP}) sigaddset(&s, x); return s; }
++void* signalThread(void*) {
++    sigset_t set = stopSignals();
++    for (;;) {
++        siginfo_t info; int sig = sigwaitinfo(&set, &info);
++        if (sig < 0) continue;
++        if (sig != SIGUSR1) { rawLog("[funkey] signal %d from PID %d: quitting", sig, (int)info.si_pid); g_stopReq = true; continue; }
++        if (g_powerReq.exchange(true)) { int k = takeOver() ? killScheduled() : 0; rawLog("[funkey] power-off signal again: %d scheduled power-off(s) ended", k); continue; }
++        double t0 = now();
++        int killed = 0; pid_t handle = -1;
++        if (takeOver()) { killed = killScheduled(); handle = spawn(kPowerdown, "handle"); }
++        notify("   Shutting down...");
++        rawLog("[funkey] power-off signal from PID %d taken over in %.1f ms: %d scheduled power-off(s) ended, 'powerdown handle' %s",
++               (int)info.si_pid, (now() - t0) * 1000, killed, handle > 0 ? "started" : takeOver() ? "NOT started" : "not on the console");
++        while (!g_powerDone && now() - t0 < 2.5) { timespec ts{0, 20 * 1000 * 1000}; nanosleep(&ts, nullptr); }
++        if (!g_powerDone) { rawLog("[funkey] the game didn't stop within 2.5 s: powering off without saving"); powerOffNow(); }
++    }
++    return nullptr;
++}
++void crashHandler(int sig, siginfo_t* info, void* ctx) {
++    unsigned long pc = 0;
++#if defined(__arm__)
++    pc = ((ucontext_t*)ctx)->uc_mcontext.arm_pc;
++#else
++    (void)ctx;
++#endif
++    rawLog("[funkey] crash: signal %d at address %p, pc 0x%lx", sig, info ? info->si_addr : nullptr, pc);
++    restoreConsole();
++    raise(sig);   // (SA_RESETHAND: the default action now, so the launcher sees the signal in the exit status)
++}
++
++// ---------------------------------------------------------------- memory, for the log
++void memInfo(int& rssKB, int& swapKB, int& availKB) {
++    rssKB = swapKB = availKB = -1;
++    char l[160];
++    if (FILE* f = fopen("/proc/self/status", "r")) {
++        while (fgets(l, sizeof l, f)) { if (!strncmp(l, "VmRSS:", 6)) rssKB = atoi(l + 6); else if (!strncmp(l, "VmSwap:", 7)) swapKB = atoi(l + 7); }
++        fclose(f);
++    }
++    if (FILE* f = fopen("/proc/meminfo", "r")) {
++        while (fgets(l, sizeof l, f)) if (!strncmp(l, "MemAvailable:", 13)) availKB = atoi(l + 13);
++        fclose(f);
++    }
++}
++}  // namespace
++
++// ---------------------------------------------------------------- entry points
++void funkeyEarly() {
++    // the stop signals go to the signal thread only: blocked here, before any other thread exists (SDL's sound
++    // thread, the log writer), which then inherit the mask
++    sigset_t set = stopSignals();
++    pthread_sigmask(SIG_BLOCK, &set, nullptr);
++    pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64 * 1024);
++    if (pthread_create(&t, &a, signalThread, nullptr) == 0) pthread_detach(t);
++    pthread_attr_destroy(&a);
++    struct sigaction sa; memset(&sa, 0, sizeof sa);
++    sa.sa_sigaction = crashHandler; sa.sa_flags = SA_SIGINFO | SA_RESETHAND; sigemptyset(&sa.sa_mask);
++    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, nullptr);
++}
++
++uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures drawn)
++    uint64_t drawn = 0;
++    std::string fbDesc;
++    bool screen = fbOpen(fbDesc);
++    logf("[funkey] %s\n", fbDesc.c_str());
++    logf("[funkey] buttons: %s\n", inputOpen().c_str());
++    if (screen) takeConsole();
++    int outW = screen ? g_fb.w : 240, outH = screen ? g_fb.h : 240;
++
++    // ---- the test script (ISAAC_FUNKEY_SCRIPT): headless test scripts' commands, by tick
++    struct Cmd { uint32_t tick; std::string op, arg; };
++    std::vector<Cmd> script; size_t scriptPos = 0;
++    if (const char* sp = getenv("ISAAC_FUNKEY_SCRIPT")) {
++        std::ifstream f(sp); std::string line;
++        while (std::getline(f, line)) { std::istringstream ss(line); Cmd c; if (ss >> c.tick >> c.op) { std::getline(ss, c.arg); size_t i = c.arg.find_first_not_of(' '); c.arg = i == std::string::npos ? "" : c.arg.substr(i); script.push_back(c); } }
++        logf("[funkey] test script %s: %zu commands (the buttons are ignored)\n", sp, script.size());
++    }
++    const bool scripted = !script.empty();
++    static const bool marks = getenv("ISAAC_TICKMARKS") != nullptr;
++
++    // ---- buttons -> the game's keys. In play: D-pad moves (WASD), X A B Y shoot up, right, down, left (arrows), L bomb
++    // (E), R the active item (space), Fn a card or pill (Q, when let go without another button: Fn combos are the
++    // system's), Start pause (P). Menus and the pause screen: D-pad chooses, A confirms, B goes back (menuui.cpp).
++    struct Map { int game, pause, menu; };
++    static const Map kMap[B_COUNT] = {
++        {'W', 0, 0}, {'S', 0, 0}, {'A', 0, 0}, {'D', 0, 0},     // D-pad (menus: navigation)
++        {39, 0, 0}, {40, 0, 0}, {38, 38, 0}, {37, 37, 0},        // A B X Y (menus: A confirm, B back)
++        {'E', 0, 0}, {32, 0, 0}, {'P', 'P', 13}, {'Q', 'P', 27}, {0, 0, 0},   // L R Start Fn Menu
++    };
++    int keyRefs[256] = {0}, held[B_COUNT] = {0};
++    auto keyDown = [&](int c) { if (c > 0 && c < 256 && keyRefs[c]++ == 0) keyEvent(c, (c == 32 || c == 13 || c == 27) ? c : 0, true); };
++    auto keyUp = [&](int c) { if (c > 0 && c < 256 && keyRefs[c] > 0 && --keyRefs[c] == 0) keyEvent(c, 0, false); };
++    bool down[B_COUNT] = {};
++    bool fnAlone = false; double fnAt = 0; int pulseKey = 0; uint32_t pulseUntil = 0;
++    int navDir = -1; double navNext = 0;
++    double menuAt = -10; bool quit = false;
++    auto onButton = [&](int b, bool isDown) {
++        down[b] = isDown;
++        if (b == B_MENU) {
++            if (!isDown) return;
++            double t = now();
++            if (t - menuAt < 2.5) { quit = true; return; }
++            menuAt = t; notify("Press MENU again^to quit");
++            return;
++        }
++        if (b == B_FN) {   // a card or pill when let go, if no other button was pressed meanwhile
++            if (isDown) { fnAlone = true; fnAt = now(); return; }
++            if (!fnAlone || now() - fnAt > 0.6) return;
++            fnAlone = false;
++            bool ig = false, play = recompInGameplay(&ig);
++            int code = play ? kMap[B_FN].game : ig ? kMap[B_FN].pause : kMap[B_FN].menu;
++            if (code && !pulseKey) { keyDown(code); pulseKey = code; pulseUntil = g_player.tick + 2; }
++            return;
++        }
++        if (isDown) fnAlone = false;
++        if (!isDown) { if (held[b]) keyUp(held[b]); held[b] = 0; return; }
++        bool ig = false, play = recompInGameplay(&ig);
++        if (!play) {   // menus and the pause screen: the controller outline
++            if (b == B_A) { padNavEvent(NAV_CONFIRM); return; }
++            if (b == B_B) { padNavEvent(NAV_BACK); return; }
++            if (b <= B_RIGHT) return;   // (navigation, with repeat: below)
++        }
++        int code = play ? kMap[b].game : ig ? kMap[b].pause : kMap[b].menu;
++        if (code) { held[b] = code; keyDown(code); }
++    };
++
++    // ---- the loop
++    const double dt = 1.0 / g_frameRate;
++    double next = now(), clockStart = next;
++    int skipped = 0;   // pictures skipped in a row
++    // statistics, logged every 5 s (and drawn over the picture with performance = 1)
++    struct Win { int ticks = 0, frames = 0, skipped = 0, stalls = 0; double logic = 0, draw = 0, present = 0, gc = 0, worst = 0; } w;
++    double winStart = now();
++    std::vector<std::string> perfLines;
++    if (screen) notify("");
++    while (!quit && !g_stopReq && !g_powerReq && !g_player.quit) {
++        // buttons (or the script)
++        if (scripted) {
++            while (scriptPos < script.size() && script[scriptPos].tick <= g_player.tick) {
++                const Cmd& c = script[scriptPos++];
++                if (c.op == "down") keyEvent(atoi(c.arg.c_str()), atoi(c.arg.c_str()) == 32 ? 32 : 0, true);
++                else if (c.op == "up") keyEvent(atoi(c.arg.c_str()), 0, false);
++                else if (c.op == "click") { double x = 0, y = 0; sscanf(c.arg.c_str(), "%lf %lf", &x, &y); mouseEvent(x, y, 0); mouseEvent(x, y, 1); mouseEvent(x, y, 2); }
++                else if (c.op == "eval") debugEval(c.arg);
++                else if (c.op == "shot") renderScreenshot(c.arg.c_str());   // (the last picture shown)
++                else if (c.op == "quit") quit = true;
++            }
++            inputPoll([&](int b, bool d) { if (b == B_MENU) onButton(b, d); });   // (Menu still quits)
++        } else {
++            inputPoll(onButton);
++            bool ig = false, play = recompInGameplay(&ig);
++            if (!play) {   // menu navigation with the D-pad, repeating while held
++                int dir = down[B_UP] ? NAV_UP : down[B_DOWN] ? NAV_DOWN : down[B_LEFT] ? NAV_LEFT : down[B_RIGHT] ? NAV_RIGHT : -1;
++                double t = now();
++                if (dir != navDir) { navDir = dir; if (dir >= 0) { padNavEvent(dir); navNext = t + 0.40; } }
++                else if (dir >= 0 && t >= navNext) { padNavEvent(dir); navNext = t + 0.12; }
++            } else navDir = -1;
++            if (pulseKey && g_player.tick >= pulseUntil) { keyUp(pulseKey); pulseKey = 0; }
++        }
++        if (quit) break;
++        if (menuAt > 0 && now() - menuAt >= 2.5) { menuAt = -10; notify(""); }
++
++        // one logic tick
++        g_player.timeMs = scripted ? g_player.tick * 1000.0 / g_frameRate : (now() - clockStart) * 1000.0;
++        if (marks) logf("OFKMEM begin %u\n", g_player.tick);
++        double t0 = now(), c0 = threadCpuMs();
++        g_shapeTick = g_player.tick;
++        runFrame(); runIntervals(); recompPatchesTick(); modsTick();
++        { bool ig = false, gp = recompInGameplay(&ig); menuUiTick(gp, ig); }
++        double t1 = now();
++        if (marks) logf("OFKMEM tick %u ents -1 ms %.3f cpu %.3f objs %zu\n", g_player.tick, (t1 - t0) * 1000, threadCpuMs() - c0, gcCount());
++        w.logic += (t1 - t0) * 1000; w.ticks++;
++
++        // the picture, unless behind the clock (never more than 3 in a row skipped)
++        bool behind = t1 > next + dt;
++        if (!behind || skipped >= 3) {
++            if (marks) logf("OFKMEM dbegin %u\n", g_player.tick);
++            double d0 = now(), dc0 = threadCpuMs();
++            g_rstats = RenderStats();
++            SnapPtr snap = buildSnapshot(); menuUiFill(*snap);
++            renderAdopt(snap);
++            renderFrame(outW, outH, 1.0);
++            if (perfOverlay) renderOverlay(perfLines);
++            renderEndFrame();
++            double d1 = now();
++            int ow, oh; const uint32_t* out = renderSoftOutput(&ow, &oh);
++            fbPresent(out, ow, oh);
++            double d2 = now();
++            if (marks) logf("OFKMEM draw %u ms %.3f cpu %.3f rasters %d quads %d present %.3f\n", g_player.tick, (d2 - d0) * 1000, threadCpuMs() - dc0, g_rstats.rasters, g_rstats.quads, (d2 - d1) * 1000);
++            w.draw += (d1 - d0) * 1000; w.present += (d2 - d1) * 1000; w.frames++; drawn++;
++            skipped = 0;
++        } else { skipped++; w.skipped++; fbKeepShown(); }
++
++        static const long memLog = getenv("ISAAC_FUNKEY_MEMLOG") ? atol(getenv("ISAAC_FUNKEY_MEMLOG")) : 0;   // (testing) memory, tick by tick
++        if ((long)g_player.tick < memLog) {
++            int rss, swap, avail; memInfo(rss, swap, avail);
++            size_t shp, snd, pages, bms; leanStats(&shp, &snd); renderMemStats(&pages, &bms);
++            logf("[funkey] tick %u: rss %d KB, swap %d KB | parsed shapes %zu KB, sounds %zu KB, rasters %zu KB, frame buffers %zu KB, GC objects %zu\n",
++                 g_player.tick, rss, swap, shp >> 10, snd >> 10, pages >> 10, bms >> 10, gcCount());
++        }
++        // the collector, after the picture (so that it never delays one)
++        double g0 = now();
++        gcCollect((g0 - t0) * 1000);
++        rasterTrim(4u << 20);   // (decoded SWF bitmaps: 4 MB, so that the shrunk 750x750 light over the rooms stays)
++        double g1 = now();
++        w.gc += (g1 - g0) * 1000;
++        w.worst = std::max(w.worst, (g1 - t0) * 1000);
++
++        // the clock: one tick every 1/30 s; a stall of more than half a second (a room being built) isn't caught up
++        next += dt;
++        double t = now();
++        if (t < next) inputWait(next - t);
++        else if (t > next + 0.5) { next = t; w.stalls++; }
++
++        if (t - winStart >= 5) {
++            int rss, swap, avail; memInfo(rss, swap, avail);
++            double secs = t - winStart; int n = std::max(1, w.ticks), nf = std::max(1, w.frames);
++            logf("[funkey] %.1f s: %.1f ticks/s, %.1f pictures/s (%d skipped), stalls %d | per tick: logic %.1f ms, gc %.1f; per picture: draw %.1f, present %.1f; worst tick %.0f ms | rss %d MB, swap %d MB, available %d MB\n",
++                 secs, w.ticks / secs, w.frames / secs, w.skipped, w.stalls, w.logic / n, w.gc / n, w.draw / nf, w.present / nf, w.worst, rss >> 10, swap >> 10, avail >> 10);
++            if (perfOverlay) {
++                char a[64], b[64], c[64];
++                snprintf(a, sizeof a, "%.0f TPS %.0f FPS", w.ticks / secs, w.frames / secs);
++                snprintf(b, sizeof b, "LOGIC %.1f DRAW %.1f GC %.1f", w.logic / n, w.draw / nf, w.gc / n);
++                snprintf(c, sizeof c, "RSS %d MB SWAP %d", rss >> 10, swap >> 10);
++                perfLines = {a, b, c};
++            }
++            w = Win(); winStart = t;
++        }
++    }
++    if (g_powerReq) logf("[funkey] stopping for the power-off\n");
++    else if (g_stopReq) logf("[funkey] stopping: asked to\n");
++    else logf("[funkey] quitting (Menu twice, or the game)\n");
++    if (screen) { if (!g_powerReq) notify(""); memset(g_fb.mem, 0, g_fb.size); fbPan(); }
++    restoreConsole();
++    return drawn;
++}
++
++// after the save: the power-off, if one was asked for (does not return then)
++void funkeyFinish() {
++    restoreConsole();
++    if (!g_powerReq) return;
++    logf("[funkey] saved: powering off\n");
++    g_powerDone = true;
++    powerOffNow();
++}
++}  // namespace fl
++#endif
+diff --git a/rt/main.cpp b/rt/main.cpp
+index 0cfca62..8431e97 100644
+--- a/rt/main.cpp
++++ b/rt/main.cpp
+@@ -72,6 +72,9 @@ extern float g_audioVolume;
+ extern std::atomic<float> g_moveScale; extern bool g_joyAccel;
+ extern bool g_shapeEvict; extern size_t g_shapeBudgetBytes, g_soundCacheBytes; extern uint32_t g_shapeTick;
+ void rasterTrim(size_t budget);
++#ifdef ISAAC_FUNKEY
++void funkeyEarly(); uint64_t funkeyPlay(bool perfOverlay); void funkeyFinish();   // (funkey.cpp; funkeyPlay returns the pictures drawn)
++#endif
+ }
+ // joystick_acceleration: how far the stick is pushed (0..1) -> movement factor. Below the dead zone nothing moves;
+ // just past it the player moves at 40% of its speed, rising linearly to 100% at 75% of the stick's travel.
+@@ -452,6 +455,9 @@ static int chooseGame(SDL_Window* win, size_t n, const std::function<std::string
+ }
+ 
+ int main(int argc, char** argv) {
++#ifdef ISAAC_FUNKEY
++    fl::funkeyEarly();   // (before any other thread: the power-off signal's thread, the crash handler)
++#endif
+     fl::platformInitLimits();
+     Config cfg;
+ #ifdef __SWITCH__
+@@ -532,6 +538,10 @@ int main(int argc, char** argv) {
+     logf("Isaac recomp (Android) - data folder %s\n", base.c_str());
+ #else
+     std::string base = SDL_GetBasePath() ? SDL_GetBasePath() : "./";
++#ifdef ISAAC_FUNKEY
++    // (the program sits in the OPK, read-only: the game, isaac.ini and the saves are in the folder the launcher names)
++    if (const char* h = getenv("ISAAC_HOME")) { base = h; if (!base.empty() && base.back() != '/') base += '/'; platformMkdir(base.substr(0, base.size() - 1)); }
++#endif
+     // saves (and the learned preload lists, screenshots, performance.txt) in a "saves" folder next to the program.
+     // Up to 1.3.0 they were in the user's profile (%APPDATA%\IsaacRecomp\WrathOfTheLamb, ~/.local/share/...): what
+     // is there is copied over the first time.
+@@ -603,6 +613,9 @@ int main(int argc, char** argv) {
+         } else if (a.size() > 4) { std::string ext = a.substr(a.size() - 4); for (auto& ch : ext) ch = (char)tolower((unsigned char)ch); if (ext == ".swf" || ext == ".exe") cfg.swf = a; }
+     }
+     if (headless) fl::g_rngSeedFixed = true;   // (deterministic tests)
++#ifdef ISAAC_FUNKEY
++    if (getenv("ISAAC_FUNKEY_SCRIPT")) fl::g_rngSeedFixed = true;   // (a test script played on the console: the same rooms)
++#endif
+     // ---- game data: the Steam Isaac.exe (the SWF is inside it) or an already extracted .swf. Three versions are
+     // supported (original, Wrath of the Lamb and Eternal Edition), each with its own recompiled code; all
+     // .exe/.swf files in the folder are scanned and, if there is more than one game, the user is asked which to open.
+@@ -648,7 +661,7 @@ int main(int argc, char** argv) {
+ #endif
+     if (headless && norender) sdlFlags = SDL_INIT_TIMER | SDL_INIT_AUDIO;
+ #ifdef ISAAC_FUNKEY
+-    if (headless) sdlFlags = SDL_INIT_TIMER | SDL_INIT_AUDIO;   // (the software renderer needs no window: nor SDL's video)
++    sdlFlags = SDL_INIT_TIMER | SDL_INIT_AUDIO;   // (the software renderer needs no window, nor SDL's video: funkey.cpp drives the screen)
+ #endif
+     if (getenv("ISAAC_TOUCH")) cfg.touchControls = true;   // (testing on PC)
+     if (cfg.touchControls) SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");   // touches are handled as such, not as a mouse
+@@ -693,7 +706,7 @@ int main(int argc, char** argv) {
+ #endif
+     SDL_Window* win = nullptr; SDL_GLContext gl = nullptr;
+ #ifdef ISAAC_FUNKEY
+-    if (headless && !norender) {   // (the software renderer: no window and no OpenGL; frames of --size, screenshots from them)
++    if (!(headless && norender)) {   // (the software renderer: no window and no OpenGL; frames of --size or the screen's)
+         if (!renderInit()) return 1;
+     } else
+ #endif
+@@ -884,7 +897,7 @@ int main(int argc, char** argv) {
+             if (snapAlways) { SnapPtr s = buildSnapshot(); if (menuUi) menuUiFill(*s); }
+             gcCollect();
+ #ifdef ISAAC_FUNKEY
+-            rasterTrim(3u << 19);   // (decoded SWF bitmaps: 1.5 MB, as on the PSP)
++            rasterTrim(4u << 20);   // (decoded SWF bitmaps: 4 MB, so that the shrunk 750x750 light over the rooms stays)
+ #endif
+             if ((int)g_player.tick == sampleTick + 1) profSampleStop();
+             double lms = (SDL_GetPerformanceCounter() - lt0) * 1000.0 / freq;
+@@ -940,6 +953,10 @@ int main(int argc, char** argv) {
+             renderedFrames++;
+         }
+     } else {
++#ifdef ISAAC_FUNKEY
++        // ---------------------------------------------------------------- FunKey S: one thread (funkey.cpp)
++        renderedFrames = funkeyPlay(perfOn);
++#else
+         // ---------------------------------------------------------------- normal mode
+         // Logic thread: exact 30 Hz ticks on its own clock; publishes one snapshot per tick.
+         // Main thread: events + rendering at the refresh rate, interpolating between snapshots.
+@@ -1944,6 +1961,7 @@ int main(int argc, char** argv) {
+         SDL_WaitThread(logic, nullptr);
+         saveLearned(preloadPath);
+         SDL_Delay(200);   // (let the writer thread finish)
++#endif
+     }
+     if (const char* lo = getenv("ISAAC_LEARN_OUT")) saveLearned(lo), SDL_Delay(300);   // (generate the preload list)
+     if (stats && !logicMs.empty()) {
+@@ -1968,6 +1986,9 @@ int main(int argc, char** argv) {
+     }
+ #endif
+     sharedObjectFlushAll();
++#ifdef ISAAC_FUNKEY
++    funkeyFinish();   // (the power-off, if one was asked for: after the save, and does not return then)
++#endif
+     if (!wavPath.empty()) { fl::audioDumpClose(); }
+     soundStopAll();
+     if (gl) SDL_GL_DeleteContext(gl);
+diff --git a/rt/raster.cpp b/rt/raster.cpp
+index 678d267..bb78898 100644
+--- a/rt/raster.cpp
++++ b/rt/raster.cpp
+@@ -111,8 +111,13 @@ static void setFillPaint(plutovg_canvas_t* cv, const FillStyle& f, const CX* cx)
+             plutovg_surface_t* s = bitmapSurface(f.bitmapId, cx);
+             if (!s) { plutovg_color_t c{0, 0, 0, 0}; plutovg_canvas_set_color(cv, &c); break; }
+             Mat bm = f.m; bm.a /= 20; bm.b /= 20; bm.c /= 20; bm.d /= 20;
++            bool smooth = f.type == 0x40 || f.type == 0x41;
++            if (CharDef* cd = g_movie.get(f.bitmapId)) if (cd->type == CH_BITMAP && ((BitmapDef*)cd)->down > 1) {
++                // (FunKey) decoded shrunk: each of its pixels stands for down x down of the original's; smoothed
++                double k = ((BitmapDef*)cd)->down; bm.a *= k; bm.b *= k; bm.c *= k; bm.d *= k; smooth = true;
++            }
+             plutovg_matrix_t m = pm(bm);
+-            plutovg_texture_smooth = (f.type == 0x40 || f.type == 0x41) ? 1 : 0;
++            plutovg_texture_smooth = smooth ? 1 : 0;
+             plutovg_canvas_set_texture(cv, s, (f.type == 0x40 || f.type == 0x42) ? PLUTOVG_TEXTURE_TYPE_TILED : PLUTOVG_TEXTURE_TYPE_PLAIN, 1.0f, &m);
+             break;
+         }
+@@ -353,6 +358,8 @@ bool rasterizeSrc(const RasterSrc& src, double scale, Raster& out) {
+     if (w <= 0 || h <= 0) return false;
+ #ifdef __PSP__
+     const int MAXT = 512;    // (the GE's largest texture, an atlas page: bigger ones are rasterized smaller and scaled up)
++#elif defined(ISAAC_FUNKEY)
++    const int MAXT = 1024;   // (memory: 4 MB at most; the software renderer rasterizes big graphics where they show instead)
+ #else
+     const int MAXT = 4096;
+ #endif
+diff --git a/rt/render_soft.cpp b/rt/render_soft.cpp
+index c1edf5b..569bcf1 100644
+--- a/rt/render_soft.cpp
++++ b/rt/render_soft.cpp
+@@ -503,8 +503,10 @@ void drawNode(uint32_t i, const FMat& parent, const CX& pcx, Mode mode) {
+             };
+             if (n.hasBounds) {
+                 if (!canvasBox(m, n.bounds, x0, y0, x1, y1)) break;   // (off the stage: not even rasterized)
++                // bigger than the stage itself (a raster of it could be many MB: the console has none to spare; one was
++                // 1705x1705, 11.6 MB): only where it shows, at most the stage's size
+                 double full = (n.bounds.x1 - n.bounds.x0) * sc * (n.bounds.y1 - n.bounds.y0) * sc;
+-                if (full > 2.0 * g_cw * g_ch && (double)(x1 - x0) * (y1 - y0) < full * 0.5) { atTransform(); break; }   // (far bigger than what shows)
++                if (full > 1.5 * g_cw * g_ch) { atTransform(); break; }
+             }
+             Entry* e = rasterFor(n, sc);
+             if (!e) break;
+diff --git a/rt/swfdata.h b/rt/swfdata.h
+index fe3ddf1..07e701b 100644
+--- a/rt/swfdata.h
++++ b/rt/swfdata.h
+@@ -118,6 +118,7 @@ struct BitmapDef : CharDef {
+     int w = 0, h = 0;
+     std::vector<uint32_t> px;   // premultiplied ARGB, decoded on demand
+     bool decoded = false;
++    int down = 1;               // (FunKey) decoded shrunk by this factor (w, h are then the shrunk size): see decode()
+     void decode();
+ };
+ 
+diff --git a/rt/swfload.cpp b/rt/swfload.cpp
+index aa948b4..3c923c9 100644
+--- a/rt/swfload.cpp
++++ b/rt/swfload.cpp
+@@ -496,12 +496,70 @@ void parseTimeline(const uint8_t* d, size_t p, size_t end, SpriteDef* sp, bool i
+ 
+ }  // namespace
+ 
++#ifdef ISAAC_FUNKEY
++// (FunKey: memory) A lossless bitmap more than 1024 pixels on a side, decoded in strips and shrunk on the fly by a power
++// of 2 (box average of premultiplied pixels): the Eternal Edition's largest, 3000x3000 (the light over every room),
++// would take 35 MB decoded and as much again for its zlib data while decoding, on a console with 45 MB. Only the
++// renderer reads these (raster.cpp scales its fill matrix by `down`): the game's logic never decodes it.
++static bool decodeShrunk(BitmapDef& b, const uint8_t* z, size_t zlen, int fmt, int ncol) {
++    if (fmt != 5 && fmt != 3) return false;
++    int k = 1; while (std::max(b.w, b.h) / k > 1024) k *= 2;
++    const int ow = (b.w + k - 1) / k, oh = (b.h + k - 1) / k;
++    z_stream zs; memset(&zs, 0, sizeof zs);
++    if (inflateInit(&zs) != Z_OK) return false;
++    zs.next_in = (Bytef*)z; zs.avail_in = (uInt)zlen;
++    auto readN = [&](uint8_t* dst, size_t n) {   // exactly n bytes (zeros past the end of the data)
++        zs.next_out = dst; zs.avail_out = (uInt)n;
++        while (zs.avail_out) { int rc = inflate(&zs, Z_NO_FLUSH); if (rc != Z_OK) break; }
++        if (zs.avail_out) memset(zs.next_out, 0, zs.avail_out);
++    };
++    const bool alpha = b.tag == 36;
++    std::vector<uint32_t> pal;
++    if (fmt == 3) {   // (Lossless2: palette colours already premultiplied)
++        int cs = alpha ? 4 : 3; std::vector<uint8_t> raw((size_t)ncol * cs); readN(raw.data(), raw.size());
++        pal.resize(ncol);
++        for (int i = 0; i < ncol; i++) pal[i] = (uint32_t)(alpha ? raw[i * cs + 3] : 255) << 24 | raw[i * cs] << 16 | raw[i * cs + 1] << 8 | raw[i * cs + 2];
++    }
++    const size_t stride = fmt == 5 ? (size_t)b.w * 4 : (size_t)((b.w + 3) & ~3);
++    std::vector<uint8_t> rows(stride * k);
++    std::vector<uint32_t> out((size_t)ow * oh);
++    std::vector<uint32_t> acc((size_t)ow * 4);
++    for (int oy = 0; oy < oh; oy++) {
++        int n = std::min(k, b.h - oy * k);
++        readN(rows.data(), stride * n);
++        std::fill(acc.begin(), acc.end(), 0);
++        for (int y = 0; y < n; y++) for (int x = 0; x < b.w; x++) {
++            uint32_t p;
++            if (fmt == 5) { const uint8_t* q = &rows[y * stride + (size_t)x * 4]; p = (uint32_t)(alpha ? q[0] : 255) << 24 | q[1] << 16 | q[2] << 8 | q[3]; }
++            else { int ix = rows[y * stride + x]; p = ix < ncol ? pal[ix] : 0; }
++            uint32_t* a = &acc[(size_t)(x / k) * 4];
++            a[0] += p >> 24; a[1] += (p >> 16) & 255; a[2] += (p >> 8) & 255; a[3] += p & 255;
++        }
++        for (int ox = 0; ox < ow; ox++) {
++            int cnt = n * std::min(k, b.w - ox * k);
++            const uint32_t* a = &acc[(size_t)ox * 4];
++            out[(size_t)oy * ow + ox] = (a[0] / cnt) << 24 | (a[1] / cnt) << 16 | (a[2] / cnt) << 8 | (a[3] / cnt);
++        }
++    }
++    inflateEnd(&zs);
++    b.px.swap(out); b.w = ow; b.h = oh; b.down = k;
++    return true;
++}
++#endif
++
+ void BitmapDef::decode() {
+     if (decoded) return;
+     decoded = true;
+     if (tag == 20 || tag == 36) {
+         Rd r(data, 0, size); r.u16(); int fmt = r.u8(); w = r.u16(); h = r.u16();
+         int ncol = fmt == 3 ? r.u8() + 1 : 0;
++#ifdef ISAAC_FUNKEY
++        if (std::max(w, h) > 1024 && decodeShrunk(*this, data + r.p, size - r.p, fmt, ncol)) {
++            static const bool log = getenv("ISAAC_BMLOG") != nullptr;
++            if (log) logf("[bitmap] %u decoded shrunk by %d: %dx%d, %zu KB\n", (unsigned)id, down, w, h, px.size() * 4 >> 10);
++            return;
++        }
++#endif
+         int outlen = 0;
+         char* z = stbi_zlib_decode_malloc((const char*)data + r.p, (int)(size - r.p), &outlen);
+         if (!z) { w = h = 0; return; }
+@@ -569,6 +627,8 @@ void BitmapDef::decode() {
+         stbi_image_free(pixels);
+     }
+     if (kPxABGR) for (auto& p : px) p = pxSwapRB(p);   // (memory order: see kPxABGR)
++    static const bool log = getenv("ISAAC_BMLOG") != nullptr;   // (testing) the SWF bitmaps decoded, and their size
++    if (log) logf("[bitmap] %u decoded (tag %d): %dx%d, %zu KB\n", (unsigned)id, tag, w, h, px.size() * 4 >> 10);
+ }
+ 
+ std::vector<uint8_t> g_jpegTables;

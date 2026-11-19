@@ -1,0 +1,31 @@
+MIT License
+
+Copyright (c) 2026 hourlysword
+Copyright (c) 2026 whylurking (IsaacRecomp)
+
+This license covers this repository: the FunKey S port's scripts, patches, launcher files and documentation. The
+patches in patches/isaacrecomp/ change IsaacRecomp (https://github.com/whylurking/IsaacRecomp), whose engine is under
+this same license, and carry parts of its code; one of them also changes PlutoVG
+(https://github.com/sammycage/plutovg), MIT License, Copyright (c) 2020-2025 Samuel Ugochukwu.
+
+It does NOT cover The Binding of Isaac, © Edmund McMillen and Florian Himsl. No game code, data or assets are
+included in this repository, nor any of IsaacRecomp's code translated from the game (its gen/ folders). To play, you
+need your own copy of the game: the program reads everything from its Isaac.exe.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

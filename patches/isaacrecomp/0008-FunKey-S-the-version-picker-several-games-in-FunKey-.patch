@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Sun, 15 Nov 2026 18:38:34 -0500
+Subject: [PATCH] FunKey S: the version picker (several games in FunKey/isaac)
+
+With several versions of the game in FunKey/isaac (Isaac.exe, Isaac-Eternal.exe...), main.cpp asks which one to
+play, as upstream's chooser does on a PC, but on the console's screen with its buttons and before the game is
+loaded: in the FunKey menu's style on black, one version at a time in the box (its name in capitals, on two lines
+when too wide) with "Press A to play", Up and Down sliding in the others (wrapping round, repeating when held), A
+or Start plays it ("Loading..." until the game shows), Menu quits back to the launcher; a power-off meanwhile
+powers off. The choice is kept in isaac.ini (game = og|wotl|eternal) and offered first the next time. Not for
+test scripts. The screen and the buttons are opened by whichever comes first (ioOpen); the menu's drawing is
+shared (boxDraw, menuBox, writePpm). Test hooks: ISAAC_FUNKEY_PICK_TEST=<names> (the picker with one game: the
+answer is only logged), ISAAC_FUNKEY_PICK_SHOTS=<prefix> (its pictures, without waiting for a button).
+---
+ rt/funkey.cpp | 148 ++++++++++++++++++++++++++++++++++++++++++++------
+ rt/main.cpp   |  21 +++++++
+ 2 files changed, 151 insertions(+), 18 deletions(-)
+
+diff --git a/rt/funkey.cpp b/rt/funkey.cpp
+index c8b05e8..2628173 100644
+--- a/rt/funkey.cpp
++++ b/rt/funkey.cpp
+@@ -12,6 +12,7 @@
+ //   with its keyboard off while the game runs.
+ // - Buttons: the button daemon's virtual keyboard (the /dev/input device with KEY_A and KEY_Q). Menu opens the FunKey
+ //   menu (volume, brightness, aspect ratio, pictures a second, exit game), in the style of FunKey-OS's emulators'.
++// - Several versions of the game in FunKey/isaac: main.cpp asks which one first (funkeyChooseGame), in the same style.
+ // - Power-off: FunKey-OS's `powerdown schedule 0.1` sends SIGUSR1 to the PID the launcher recorded and powers off 0.1 s
+ //   later. A thread of its own takes the signal at once (the loop may be inside a room build): it ends the scheduled
+ //   power-off, starts `powerdown handle` and shows "Shutting down..."; the loop stops, main.cpp writes the save, and
+@@ -23,7 +24,8 @@
+ // Testing: ISAAC_FUNKEY_SCRIPT=<file> plays a headless test script (tools: "<tick> down|up <code>", "click x y",
+ // "eval ...", "shot file", "quit"; and "menushot <item> <file> [1]", "aspect stretched|4:3") instead of the buttons, with the game's random numbers fixed; ISAAC_TICKMARKS=1
+ // writes "OFKMEM" lines per tick and per picture (scripts/measure/tick-cost.py); ISAAC_FUNKEY_NO_POWEROFF=1 never
+-// runs powerdown (a SIGUSR1 then only saves and quits).
++// runs powerdown (a SIGUSR1 then only saves and quits). The version picker with one game: ISAAC_FUNKEY_PICK_TEST=
++// <name>,<name>... (main.cpp: the answer is only logged), ISAAC_FUNKEY_PICK_SHOTS=<prefix> (its pictures, below).
+ #ifdef ISAAC_FUNKEY
+ #include "display.h"
+ #include "snapshot.h"
+@@ -245,6 +247,17 @@ void inputWait(double seconds) {   // sleep, waking early when a button changes
+     if (p.empty()) { timespec ts{(time_t)seconds, (long)((seconds - (time_t)seconds) * 1e9)}; nanosleep(&ts, nullptr); return; }
+     poll(p.data(), p.size(), (int)std::ceil(seconds * 1000));
+ }
++// the screen and the buttons, once (the version picker opens them before the game is loaded, funkeyPlay otherwise)
++bool g_ioOpen = false, g_screen = false;
++void ioOpen() {
++    if (g_ioOpen) return;
++    g_ioOpen = true;
++    std::string fbDesc;
++    g_screen = fbOpen(fbDesc);
++    logf("[funkey] %s\n", fbDesc.c_str());
++    logf("[funkey] buttons: %s\n", inputOpen().c_str());
++    if (g_screen) takeConsole();
++}
+ 
+ // ---------------------------------------------------------------- signals: stop, power-off, crashes
+ std::atomic<bool> g_stopReq{false}, g_powerReq{false}, g_powerDone{false};
+@@ -444,10 +457,13 @@ void menuArrows(plutovg_canvas_t* cv) {   // 20x13, halfway between the box and
+     plutovg_canvas_move_to(cv, x0, bottom); plutovg_canvas_line_to(cv, x0 + 20, bottom); plutovg_canvas_line_to(cv, x0 + 10, bottom + 13); plutovg_canvas_close_path(cv);
+     setRgb(cv, kBoxRgb); plutovg_canvas_fill(cv);
+ }
+-// an item in its box, dy pixels below its place
+-void menuItem(plutovg_canvas_t* cv, int item, float dy) {
++void menuBox(plutovg_canvas_t* cv, float dy) {   // the box, dy pixels below its place
+     plutovg_canvas_round_rect(cv, (MW - BOX_W) / 2.f, (MH - BOX_H) / 2.f + dy, BOX_W, BOX_H, 5, 5);
+     setRgb(cv, kBoxRgb); plutovg_canvas_fill(cv);
++}
++// an item in its box, dy pixels below its place
++void menuItem(plutovg_canvas_t* cv, int item, float dy) {
++    menuBox(cv, dy);
+     float mid = MH / 2.f + dy;
+     char line[64];
+     switch (item) {
+@@ -466,16 +482,24 @@ void menuItem(plutovg_canvas_t* cv, int item, float dy) {
+             break;
+     }
+ }
+-// the menu's picture: the darkened game, the item (or two, sliding: `slide` pixels done, dir +1 = the next one coming
+-// up from below)
+-void menuDraw(int prev, int slide, int dir) {
++// the menu's picture: what is behind (g_menu.dim: the darkened game), the item `cur` in its box with the arrows (or
++// two, sliding: `slide` pixels done, dir +1 = the next one coming up from below); item(cv, which, dy) draws one
++template <class F> void boxDraw(int cur, int prev, int slide, int dir, F&& item, bool arrows = true) {
+     g_menu.out = g_menu.dim;
+     plutovg_surface_t* s = plutovg_surface_create_for_data((unsigned char*)g_menu.out.data(), MW, MH, MW * 4);
+     plutovg_canvas_t* cv = plutovg_canvas_create(s);
+-    if (slide <= 0) { menuItem(cv, g_menu.item, 0); menuArrows(cv); }
+-    else { menuItem(cv, prev, (float)(-dir * slide)); menuItem(cv, g_menu.item, (float)(dir * (MH - slide))); }
++    if (slide <= 0) { item(cv, cur, 0.f); if (arrows) menuArrows(cv); }
++    else { item(cv, prev, (float)(-dir * slide)); item(cv, cur, (float)(dir * (MH - slide))); }
+     plutovg_canvas_destroy(cv); plutovg_surface_destroy(s);
+ }
++void menuDraw(int prev, int slide, int dir) { boxDraw(g_menu.item, prev, slide, dir, menuItem); }
++void writePpm(const char* path) {   // (tests) the menu's picture
++    if (FILE* f = fopen(path, "wb")) {
++        fprintf(f, "P6\n%d %d\n255\n", MW, MH);
++        for (uint32_t c : g_menu.out) { uint8_t px[3] = {(uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c}; fwrite(px, 1, 3, f); }
++        fclose(f);
++    }
++}
+ void menuBackground() {   // the picture last drawn, darkened
+     int ow = 0, oh = 0; const uint32_t* last = renderSoftOutput(&ow, &oh);
+     g_menu.dim.assign((size_t)MW * MH, 0xff000000u);
+@@ -493,11 +517,7 @@ void menuShot(int item, bool confirm, const char* path) {
+     if (g_menu.volume < 0) g_menu.volume = 70;
+     if (g_menu.brightness < 0) g_menu.brightness = 50;
+     menuDraw(0, 0, 0);
+-    if (FILE* f = fopen(path, "wb")) {
+-        fprintf(f, "P6\n%d %d\n255\n", MW, MH);
+-        for (uint32_t c : g_menu.out) { uint8_t px[3] = {(uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c}; fwrite(px, 1, 3, f); }
+-        fclose(f);
+-    }
++    writePpm(path);
+     g_menu.item = keep; g_menu.confirm = keepC;
+ }
+ // the menu until it closes; true: EXIT GAME chosen. outW/outH: the frame's size (the picture drawn again for the
+@@ -574,6 +594,88 @@ bool menuRun(int outW, int outH) {
+     return exitGame;
+ }
+ 
++// ---------------------------------------------------------------- the version picker
++// Several versions of the game in FunKey/isaac (Isaac.exe, Isaac-Eternal.exe...: main.cpp finds them, as upstream does
++// on a PC): which one to play, asked before it is loaded, in the menu's style on black: one version at a time in the
++// box, Up and Down to the others (sliding in, held: again after 0.5 s, then every 0.1 s), A or Start plays it
++// ("Loading..." stays until the game shows), Menu quits. main.cpp keeps the choice in isaac.ini (game = og, wotl or
++// eternal) and offers it first the next time.
++// Tests: ISAAC_FUNKEY_PICK_SHOTS=<prefix> writes each version's picture and then "Loading..." into <prefix>0.ppm,
++// <prefix>1.ppm... and takes the version offered first, without waiting for a button; main.cpp's ISAAC_FUNKEY_PICK_TEST.
++struct PickState { std::vector<std::string> names; bool loading = false; } g_pick;
++float textWidth(const std::string& s, float size) {
++    if (!g_menu.bold) return (float)s.size() * 6 * (size > 18 ? 3 : 2);
++    plutovg_rect_t ext;
++    return plutovg_font_face_text_extents(g_menu.bold, size, s.c_str(), -1, PLUTOVG_TEXT_ENCODING_UTF8, &ext);
++}
++// a name in capitals, on one line or, too wide for the box, two (split at the space that leaves the longer one shortest)
++std::vector<std::string> pickLines(const std::string& name, float size) {
++    std::string up = name; for (auto& c : up) c = (char)toupper((unsigned char)c);
++    const float maxW = BOX_W - 16;
++    if (textWidth(up, size) <= maxW) return {up};
++    std::vector<std::string> best = {up}; float bestW = 1e9f;
++    for (size_t i = up.find(' '); i != std::string::npos; i = up.find(' ', i + 1)) {
++        std::string a = up.substr(0, i), b = up.substr(i + 1);
++        float w = std::max(textWidth(a, size), textWidth(b, size));
++        if (w < bestW) { bestW = w; best = {a, b}; }
++    }
++    return best;
++}
++void pickItem(plutovg_canvas_t* cv, int i, float dy) {   // a version in its box, dy pixels below its place
++    menuBox(cv, dy);
++    float mid = MH / 2.f + dy;
++    std::vector<std::string> lines = pickLines(g_pick.names[i], 22);
++    float y = mid - 14 - 13.f * (float)(lines.size() - 1);
++    for (auto& l : lines) { menuText(cv, l.c_str(), 22, y); y += 26; }
++    menuText(cv, g_pick.loading ? "Loading..." : "Press A to play", 16, mid + 2 * LINE);
++}
++// the version chosen (an index of names), or -1: Menu pressed, the game asked to stop or the console powering off
++int pickRun(const std::vector<std::string>& names, int sel) {
++    menuFonts();
++    g_pick.names = names; g_pick.loading = false;
++    g_menu.dim.assign((size_t)MW * MH, 0xff000000u);   // (nothing behind it yet)
++    const int n = (int)names.size();
++    sel = std::max(0, std::min(n - 1, sel));
++    if (const char* p = getenv("ISAAC_FUNKEY_PICK_SHOTS")) {   // (tests) each version's picture, then "Loading..."
++        for (int i = 0; i <= n; i++) {
++            g_pick.loading = i == n;
++            boxDraw(i < n ? i : sel, 0, 0, 0, pickItem, !g_pick.loading);
++            writePpm((p + std::to_string(i) + ".ppm").c_str());
++        }
++        return sel;
++    }
++    if (!g_screen || g_inputFds.empty()) { logf("[funkey] version picker: no %s\n", g_screen ? "buttons" : "screen"); return sel; }
++    int prev = sel, slide = 0, dir = 0, held = -1, chosen = -2; double repeatAt = 0; bool dirty = true;
++    auto move = [&](int d) { prev = sel; sel = (sel + d + n) % n; dir = d; slide = 30; };
++    while (chosen == -2 && !g_stopReq && !g_powerReq) {
++        inputPoll([&](int b, bool d) {
++            if (!d) { if (b == held) held = -1; return; }
++            if (chosen != -2) return;
++            switch (b) {
++                case B_UP: case B_DOWN: if (slide == 0) { move(b == B_DOWN ? 1 : -1); held = b; repeatAt = now() + 0.5; } break;
++                case B_A: case B_START: chosen = sel; break;
++                case B_MENU: chosen = -1; break;
++                default: break;
++            }
++        });
++        if (chosen == -1) break;
++        if (chosen >= 0) { slide = 0; g_pick.loading = true; dirty = true; }   // (the last picture: "Loading...")
++        double t = now();
++        if (chosen == -2 && held >= 0 && slide == 0 && t >= repeatAt) { move(held == B_DOWN ? 1 : -1); repeatAt = t + 0.1; }
++        if (dirty || slide > 0) {
++            boxDraw(sel, prev, slide, dir, pickItem, !g_pick.loading);
++            fbPresent(g_menu.out.data(), MW, MH);
++            dirty = false;
++            if (slide > 0 && (slide += 30) >= MH) { slide = 0; dirty = true; }
++            if (chosen == -2) inputWait(0.02);   // (50 pictures a second while sliding)
++        } else {
++            fbKeepShown();
++            inputWait(0.05);
++        }
++    }
++    return chosen >= 0 ? chosen : -1;
++}
++
+ // ---------------------------------------------------------------- memory, for the log
+ void memInfo(int& rssKB, int& swapKB, int& availKB) {
+     rssKB = swapKB = availKB = -1;
+@@ -603,13 +705,23 @@ void funkeyEarly() {
+     for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, nullptr);
+ }
+ 
++// which version to play when FunKey/isaac holds several (their names; `initial` offered first): the index chosen, or
++// -1 to quit (main.cpp then calls funkeyFinish(), for a power-off)
++int funkeyChooseGame(const std::vector<std::string>& names, int initial) {
++    if (names.empty()) return -1;
++    ioOpen();
++    initial = std::max(0, std::min((int)names.size() - 1, initial));
++    logf("[funkey] version picker: %zu versions, %s offered first\n", names.size(), names[initial].c_str());
++    int c = pickRun(names, initial);
++    logf("[funkey] version picker: %s\n", c >= 0 ? names[c].c_str() : g_powerReq ? "the console is powering off" : g_stopReq ? "asked to stop" : "Menu: quit");
++    if (c < 0 && g_screen && !g_powerReq) { memset(g_fb.mem, 0, g_fb.size); fbPan(); }
++    return c;
++}
++
+ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures drawn)
+     uint64_t drawn = 0;
+-    std::string fbDesc;
+-    bool screen = fbOpen(fbDesc);
+-    logf("[funkey] %s\n", fbDesc.c_str());
+-    logf("[funkey] buttons: %s\n", inputOpen().c_str());
+-    if (screen) takeConsole();
++    ioOpen();
++    const bool screen = g_screen;
+     int outW = screen ? g_fb.w : 240, outH = screen ? g_fb.h : 240;
+ 
+     // ---- the test script (ISAAC_FUNKEY_SCRIPT): headless test scripts' commands, by tick
+diff --git a/rt/main.cpp b/rt/main.cpp
+index ff01d66..180a18f 100644
+--- a/rt/main.cpp
++++ b/rt/main.cpp
+@@ -74,6 +74,7 @@ extern bool g_shapeEvict; extern size_t g_shapeBudgetBytes, g_soundCacheBytes; e
+ void rasterTrim(size_t budget);
+ #ifdef ISAAC_FUNKEY
+ void funkeyEarly(); uint64_t funkeyPlay(bool perfOverlay); void funkeyFinish();   // (funkey.cpp; funkeyPlay returns the pictures drawn)
++int funkeyChooseGame(const std::vector<std::string>& names, int initial);           // (the version picker: -1 to quit)
+ #endif
+ }
+ // joystick_acceleration: how far the stick is pushed (0..1) -> movement factor. Below the dead zone nothing moves;
+@@ -765,6 +766,26 @@ int main(int argc, char** argv) {
+             if (choice < 0) { SDL_GL_DeleteContext(gl); SDL_DestroyWindow(win); SDL_Quit(); return 0; }
+             saveIniValue(base + "isaac.ini", "game", found[choice].g->tag);
+         }
++#ifdef ISAAC_FUNKEY
++        // (no window: the picker on the console's screen, with its buttons; not for a test script)
++        if (found.size() > 1 && forcedGame.empty() && !headless && !getenv("ISAAC_FUNKEY_SCRIPT")) {
++            std::vector<std::string> names;
++            for (auto& f : found) names.push_back(!strcmp(f.g->tag, "og") ? "Original" : f.g->title);
++            choice = fl::funkeyChooseGame(names, choice);
++            if (choice < 0) { fl::funkeyFinish(); SDL_Quit(); return 0; }
++            saveIniValue(base + "isaac.ini", "game", found[choice].g->tag);
++        }
++        if (const char* t = getenv("ISAAC_FUNKEY_PICK_TEST")) {   // (testing: the picker with these names, its answer only logged)
++            std::vector<std::string> names; std::string cur;
++            for (const char* c = t;; c++) {
++                if (*c && *c != ',') { cur += *c; continue; }
++                if (!cur.empty()) names.push_back(cur);
++                cur.clear();
++                if (!*c) break;
++            }
++            if (!names.empty()) logf("version picker test: %d\n", fl::funkeyChooseGame(names, 0));
++        }
++#endif
+     }
+     std::string err;
+     fl::initGlobals();

@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Sun, 15 Nov 2026 16:12:13 -0500
+Subject: [PATCH] FunKey S: room layers at the picture's scale, profile-guided
+ builds, a faster SWF bit reader
+
+- The room layers (floor and walls, blood, gibs) at the FunKey picture's scale: the game chooses their resolution
+  itself, as quality tiers from its display scale; genpsp/ pins the PSP's (364x272 at 0.566667), which the FunKey's
+  240x180 picture showed at 0.661. When the game creates a room layer at a tier above the picture's, its tier is
+  moved to the picture's (240x180 at 0.3747): the layers are drawn 1:1 without shrunk copies, what is drawn into them
+  (each room entry's floor and walls) is rasterized at the size it is seen (a room's drawing a third shorter on the
+  PC), and they take a third of the memory. The logic is the same (same-game against the PC build, which keeps the
+  PSP's tier). ISAAC_ROOM_TIER=0 or ISAAC_SOFT_STAGERES=1 keep the PSP's tier.
+- The BitmapData leaf cache 6 -> 3 MB (as many reuses with the smaller leaves), the renderer's cache 4 -> 5 MB.
+- ISAAC_PGO=generate|use (ISAAC_PGO_DIR): GCC's profile-guided optimisation; code never run in training is
+  optimised for size (the FunKey program's code 10.9 -> 9.1 MB).
+- The SWF parser's bit reader takes up to the rest of a byte at a time instead of one bit.
+---
+ CMakeLists.txt     | 12 ++++++++++++
+ rt/builtins.cpp    | 30 ++++++++++++++++++++++++++++++
+ rt/platform.cpp    |  8 ++++----
+ rt/render_soft.cpp |  4 ++--
+ rt/swfload.cpp     |  8 +++++---
+ 5 files changed, 53 insertions(+), 9 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e0fe3c3..2d09839 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,6 +15,18 @@ option(ISAAC_FUNKEY "FunKey S build (lean loading, PSP stage, one thread)" OFF)
+ if(ISAAC_FUNKEY)
+   set(NO_SYSTEM_GL ON)
+ endif()
++# Profile-guided optimisation (GCC): ISAAC_PGO=generate builds a program that records how its code runs (into
++# ISAAC_PGO_DIR, when it exits); ISAAC_PGO=use builds again in the same build folder with that record (the records are
++# named after the object files' paths). Unexecuted code is then optimised for size.
++set(ISAAC_PGO "" CACHE STRING "profile-guided optimisation: generate, use, or empty")
++set(ISAAC_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "where the profile is written (generate) and read (use)")
++if(ISAAC_PGO STREQUAL "generate")
++  add_compile_options(-fprofile-generate=${ISAAC_PGO_DIR} -fprofile-update=single)
++  add_link_options(-fprofile-generate=${ISAAC_PGO_DIR})
++elseif(ISAAC_PGO STREQUAL "use")
++  # (a function changed since the profile was recorded is compiled without it, rather than failing the build)
++  add_compile_options(-fprofile-use=${ISAAC_PGO_DIR} -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
++endif()
+ 
+ if(NINTENDO_SWITCH)
+   set(SDL2_INCLUDE_DIRS ${PORTLIBS}/include/SDL2)
+diff --git a/rt/builtins.cpp b/rt/builtins.cpp
+index c2a7914..130014c 100644
+--- a/rt/builtins.cpp
++++ b/rt/builtins.cpp
+@@ -383,9 +383,39 @@ static int roomLayerHeight(int w, int h) {
+     logf("room layer: %dx%d made %dx%d (the HUD's 75 units at scale %g)\n", w, h, w, fixed, hdx);
+     return fixed;
+ }
++// (FunKey) The room layers at the picture's scale. The game sets the resolution of its room layers (floor and walls,
++// blood, gibs: gridxs x gridys pixels, hdx pixels per game unit) from its display scale, as quality tiers (640x480 at
++// 1, 800x620 at 1.25, 1100x800 at 1.667); genpsp/ pins the PSP's screen (364x272 at 0.566667: the stage's own scale,
++// 272/480). The FunKey shows the stage at 0.661 of that (renderer: a 240x180 canvas), and the renderer shrank each
++// layer again whenever it changed. When the game creates a room layer at a tier above the picture's, its tier is
++// moved to the picture's (240x180 at 0.3747): the layers are drawn 1:1, what is drawn into them is rasterized at the
++// size it is seen (each room entry draws the room's floor and walls into one), and they take a third of the memory.
++// The tier is the game's own choice, its logic doesn't depend on it (the collision grid keeps its own size: gen.py
++// --room-scale); scripts/measure/same-game.sh checks it against the PC build, which keeps the PSP's tier.
++static void roomTierForPicture(int& w, int& h) {
++#if defined(ISAAC_FUNKEY)
++    static const bool off = getenv("ISAAC_SOFT_STAGERES") != nullptr || (getenv("ISAAC_ROOM_TIER") && atoi(getenv("ISAAC_ROOM_TIER")) == 0);
++    static Str* sA = intern("a"); static Str* sHdx = intern("hdx"); static Str* sGx = intern("gridxs"); static Str* sGy = intern("gridys");
++    if (off || h >= w || g_stageW <= 0 || g_stageH <= 0 || !vm.root) return;
++    Value a = getMemK(Value((Object*)vm.root), sA);
++    if (!a.isObj()) return;
++    double hdx = toNum(getMemK(a, sHdx)), gx = toNum(getMemK(a, sGx)), gy = toNum(getMemK(a, sGy));
++    if (!(hdx > 0 && hdx < 1) || w != (int)gx || (h != (int)gy && h != (int)gy - 75)) return;
++    double cs = std::min(1.0, std::min(240.0 / g_stageW, 240.0 / g_stageH));   // (the FunKey's picture: renderFrame's canvas)
++    double target = g_stageH / 480.0 * cs;                                      // (pixels per game unit on that canvas)
++    if (!(hdx > target + 1e-6)) return;
++    int ngx = ((int)std::lround(640 * target) + 3) & ~3, ngy = (int)std::lround(480 * target);
++    setMemK(a, sHdx, Value(target)); setMemK(a, sGx, Value((double)ngx)); setMemK(a, sGy, Value((double)ngy));
++    logf("room layers: %dx%d at %g -> %dx%d at %g (the picture's scale)\n", (int)gx, (int)gy, hdx, ngx, ngy, target);
++    h = h == (int)gy ? ngy : ngy - 75; w = ngx;   // (then roomLayerHeight as for any room layer)
++#else
++    (void)w; (void)h;
++#endif
++}
+ static Value bd_ctor(Act&, Value, int argc, Value* argv) {
+     BitmapData* b = gcNew<BitmapData>(); b->proto = protos::bitmapdata;
+     b->w = std::max(0, std::min(8191, toInt32(arg(argc, argv, 0)))); b->h = std::max(0, std::min(8191, toInt32(arg(argc, argv, 1))));
++    roomTierForPicture(b->w, b->h);
+     b->h = roomLayerHeight(b->w, b->h);
+     b->transparent = argc > 2 ? truthy(argv[2]) : true;
+     uint32_t fill = argc > 3 ? (uint32_t)toInt32(argv[3]) : 0xffffffffu;
+diff --git a/rt/platform.cpp b/rt/platform.cpp
+index 8d13648..4dcbca1 100644
+--- a/rt/platform.cpp
++++ b/rt/platform.cpp
+@@ -51,10 +51,10 @@ void platformInitLimits() {
+     g_lim = {15000, 4u << 20, 1u << 20, 2u << 20, 0, 0, 0, 6, 2.0, true, 1.4};   // (objects ~200 bytes: collect early)
+ #if defined(ISAAC_FUNKEY)
+     // The leaves drawn into BitmapData (each room's floor and walls are drawn into the room's bitmap when it is entered:
+-    // 80-110 shapes): with 2 MB they were rasterized again in every room, with 6 MB most rooms reuse the floor's
+-    // (a room's drawing 40% shorter on average, many rooms near nothing; 16 MB does no better). The renderer's own
+-    // cache went from 8 to 4 MB for it (its graphics are smaller at the FunKey picture scale).
+-    g_lim.leafBudgetBytes = 6u << 20;
++    // 80-110 shapes): with 2 MB they were rasterized again in every room; with room layers at the PSP's scale 6 MB let
++    // most rooms reuse the floor's (a room's drawing 40% shorter on average, many rooms near nothing). With the room
++    // layers at the picture's scale (builtins.cpp, roomTierForPicture) the leaves are smaller: 3 MB does the same.
++    g_lim.leafBudgetBytes = 3u << 20;
+     if (const char* e = getenv("ISAAC_LEAF_KB")) g_lim.leafBudgetBytes = (size_t)atol(e) << 10;   // (testing)
+ #endif
+ #elif defined(FL_SWITCH_MEMORY)
+diff --git a/rt/render_soft.cpp b/rt/render_soft.cpp
+index b4fde46..2220b9b 100644
+--- a/rt/render_soft.cpp
++++ b/rt/render_soft.cpp
+@@ -831,8 +831,8 @@ void beginFrame(uint32_t clearArgb) {
+ // ---------------------------------------------------------------- interface (render.h)
+ bool renderInit() {
+     // (graphics rasterized at the FunKey's picture scale: in floor 1, as few rasterizations with 5 MB as with 8 MB, 8%
+-    // more with 4 MB, 45% more with 3 MB. 4 MB: the memory went to the cache of BitmapData leaves, platform.cpp)
+-    g_cacheBudget = 4u << 20;
++    // more with 4 MB, 45% more with 3 MB)
++    g_cacheBudget = 5u << 20;
+     if (const char* e = getenv("ISAAC_SOFT_CACHE_KB")) g_cacheBudget = (size_t)atol(e) << 10;   // (testing)
+     if (getenv("ISAAC_SOFT_STRETCH")) g_softStretch = true;   // (testing: the whole window, like the FunKey's "full")
+     return true;
+diff --git a/rt/swfload.cpp b/rt/swfload.cpp
+index 3c923c9..4e19ea2 100644
+--- a/rt/swfload.cpp
++++ b/rt/swfload.cpp
+@@ -33,11 +33,13 @@ struct Rd {
+     float fixed8() { return (int16_t)u16() / 256.0f; }
+     float f32() { uint32_t v = u32(); float f; memcpy(&f, &v, 4); return f; }
+     std::string str() { align(); size_t s = p; while (p < end && d[p]) p++; std::string r((const char*)d + s, p - s); p++; return r; }
+-    uint32_t ub(int n) {
++    uint32_t ub(int n) {   // (most significant bit first; up to the rest of the current byte at a time)
+         uint32_t v = 0;
+-        for (int i = 0; i < n; i++) {
++        while (n > 0) {
+             if (bitpos == 0) { bitbuf = p < end ? d[p] : 0; p++; bitpos = 8; }
+-            bitpos--; v = (v << 1) | ((bitbuf >> bitpos) & 1);
++            int take = n < bitpos ? n : bitpos;
++            v = (v << take) | ((bitbuf >> (bitpos - take)) & ((1u << take) - 1));
++            bitpos -= take; n -= take;
+         }
+         return v;
+     }

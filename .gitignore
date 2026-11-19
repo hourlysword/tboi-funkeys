@@ -1,0 +1,31 @@
+# Nothing of the upstream checkout or the builds lives here: they are in $TFK_WORK (scripts/env.sh), on a Linux
+# filesystem. What a build or a test leaves next to the repository:
+/out/
+*.opk
+
+# The player's own game (the Steam Isaac.exe), and anything taken out of it: never committed. Generated game code
+# (gen*/) never leaves the upstream work tree either.
+/game files/
+*.exe
+*.swf
+*.sol
+*.cache
+
+# The upstream clone made while planning (reference only; the work tree is $TFK_WORK/IsaacRecomp)
+/IsaacRecomp/
+
+# Internal notes for testers and test results: kept on this computer, never committed
+/docs-private/
+
+# Logs and results brought back from the console or the test VM
+/testing/
+
+# Editor and OS leftovers
+__pycache__/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Session folders of the Claude desktop app
+/.claude/

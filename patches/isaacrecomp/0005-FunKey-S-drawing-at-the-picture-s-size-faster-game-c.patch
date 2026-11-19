@@ -1,0 +1,700 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Sat, 31 Oct 2026 01:15:43 -0400
+Subject: [PATCH] FunKey S: drawing at the picture's size, faster game code,
+ shorter room entries
+
+Measured on the console with a whole-system profile (the game's CPU time per tick 27.5 -> 20.5 ms):
+
+- The software renderer draws the stage at the picture's size (240x180 for 363x272) instead of at the stage's size
+  shrunk at the end: shapes and texts rasterized at their size on screen, the game's stage-sized BitmapData drawn
+  1:1 from copies shrunk by area averaging, made again only when they change. Drawing a picture in the floors
+  14-16 ms -> 7-8 ms, the title 31 -> 17 ms. (Blending and scaling were bound by memory traffic, not arithmetic.)
+  ISAAC_SOFT_STAGERES=1 keeps the old path.
+- An animation shown in place is no longer taken for a still graphic (each of its frames was rasterized at its
+  transform: about one rasterization per picture).
+- NEON: the screen copy (RGB565 with dither), blending, the scaler's horizontal pass, bilinear resampling inside
+  textures; the same pixels as the plain C code.
+- ISAAC_GEN_FLAGS: extra compiler options for the generated game code; the FunKey's default "-O2 -mthumb": the code
+  29% smaller and the game's logic 13% faster (17% with 10-19 enemies on screen).
+- The BitmapData leaf cache 2 -> 6 MB on the FunKey (each room entry draws the room's floor and walls into its
+  bitmap; most rooms now reuse the floor's), the renderer's cache 8 -> 4 MB. PlutoVG's coordinate rounding inline
+  (roundf was a library call per point on ARMv7).
+- Sound: 16-bit samples to FunKey-OS's default device (its route plugin converted every float sample); the mixer
+  skips its cubic interpolation where it falls on a sample.
+- Test hooks: ISAAC_SOFT_RASTERLOG covers rasterizations at a transform, ISAAC_SOFT_BMLOG (how often the bitmaps
+  drawn change), ISAAC_LEAF_KB.
+---
+ CMakeLists.txt                                |  13 +
+ rt/audio.cpp                                  |  25 +-
+ rt/funkey.cpp                                 |  23 +-
+ rt/platform.cpp                               |   8 +
+ rt/render_soft.cpp                            | 304 ++++++++++++++----
+ .../plutovg/source/plutovg-rasterize.c        |   5 +-
+ 6 files changed, 311 insertions(+), 67 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 954e6e3..e0fe3c3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -138,6 +138,19 @@ add_library(isaacgen STATIC ${GEN_SRC})
+ target_include_directories(isaacgen PRIVATE rt)
+ # the generated code is huge: -O1 keeps compile times reasonable
+ target_compile_options(isaacgen PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-O1 -fno-strict-aliasing -w>)
++# options added after those for the generated code only (a later -O wins), e.g. "-O2 -mthumb". The FunKey (ARM):
++# -O2 in Thumb-2, the code 29% smaller and the game's logic 13% faster on the console than at -O1 in ARM mode (17% in
++# rooms with 10-19 enemies): that code mostly waits for memory, the instruction cache's included.
++if(ISAAC_FUNKEY AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
++  set(ISAAC_GEN_FLAGS_DEFAULT "-O2 -mthumb")
++else()
++  set(ISAAC_GEN_FLAGS_DEFAULT "")
++endif()
++set(ISAAC_GEN_FLAGS "${ISAAC_GEN_FLAGS_DEFAULT}" CACHE STRING "extra compiler options for the generated game code")
++if(ISAAC_GEN_FLAGS)
++  separate_arguments(ISAAC_GEN_FLAGS_LIST UNIX_COMMAND "${ISAAC_GEN_FLAGS}")
++  target_compile_options(isaacgen PRIVATE ${ISAAC_GEN_FLAGS_LIST})
++endif()
+ 
+ # the mods that come with the program (mods/*.mod): built in, so the program can write them into a new "mods" folder
+ # (Android has no package folder to copy them from). Regenerated when a .mod file changes.
+diff --git a/rt/audio.cpp b/rt/audio.cpp
+index 8871d81..cdf85e2 100644
+--- a/rt/audio.cpp
++++ b/rt/audio.cpp
+@@ -180,8 +180,8 @@ static bool refill(Chan& c) {
+ 
+ static void mix(void* userdata, Uint8* stream, int len) {
+     (void)userdata;
+-#ifdef __PSP__
+-    // (PSP: 16-bit output: mixed in floats here, converted at the end instead of by SDL)
++#if defined(__PSP__) || defined(ISAAC_FUNKEY)
++    // (PSP, FunKey: 16-bit output: mixed in floats here, converted at the end instead of by SDL or ALSA)
+     static float s_mix[4096 * 2];
+     int frames = std::min(4096, len / (int)(sizeof(int16_t) * 2)); float* out = s_mix;
+ #else
+@@ -234,8 +234,9 @@ static void mix(void* userdata, Uint8* stream, int len) {
+             auto cr = [t](float pm, float p0, float p1, float p2) {
+                 return p0 + 0.5f * t * (p1 - pm + t * (2 * pm - 5 * p0 + 4 * p1 - p2 + t * (3 * (p0 - p1) + p2 - pm)));
+             };
+-            float l = cr(c.buf[0][im], c.buf[0][ip], c.buf[0][ip + 1], c.buf[0][i2]);
+-            float r = cr(c.buf[1][im], c.buf[1][ip], c.buf[1][ip + 1], c.buf[1][i2]);
++            float l, r;
++            if (t == 0.f) { l = c.buf[0][ip]; r = c.buf[1][ip]; }   // (on a sample: what cr gives; a sound at the output's rate)
++            else { l = cr(c.buf[0][im], c.buf[0][ip], c.buf[0][ip + 1], c.buf[0][i2]); r = cr(c.buf[1][im], c.buf[1][ip], c.buf[1][ip + 1], c.buf[1][i2]); }
+             if (hasEnv) { float el, er; envStep(c, el, er); l *= el; r *= er; }
+             out[i * 2] += l * lv; out[i * 2 + 1] += r * rv;
+             POS_ADV();
+@@ -252,17 +253,17 @@ static void mix(void* userdata, Uint8* stream, int len) {
+         if (c.decOk) c.curPub.store((double)(c.pcm ? c.pcmPos : c.dec.currentPCMFrame) - c.bufLen + c.pos, std::memory_order_relaxed);
+         if (ended) { if (c.decOk && !c.pcm) drmp3_uninit(&c.dec); c.pcm.reset(); c.rec.reset(); c.decOk = false; c.active.store(false, std::memory_order_release); }
+     }
+-#ifdef __PSP__
+-    int16_t* o16 = (int16_t*)stream;
+-    for (int i = 0; i < frames * 2; i++) { float v = out[i] * 32767.f; o16[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v); }
+-#else
+-    for (int i = 0; i < frames * 2; i++) out[i] = std::max(-1.f, std::min(1.f, out[i]));
+-#endif
+ #ifdef ISAAC_FUNKEY
+     // The FunKey's speaker is on the right channel only, and FunKey-OS's default ALSA route adds left and right into
+     // it (which clips): (L + R) / 2 on the right, nothing on the left. (Found in my other FunKey S projects.)
+     if (userdata) for (int i = 0; i < frames; i++) { out[i * 2 + 1] = (out[i * 2] + out[i * 2 + 1]) * 0.5f; out[i * 2] = 0.f; }
+ #endif
++#if defined(__PSP__) || defined(ISAAC_FUNKEY)
++    int16_t* o16 = (int16_t*)stream;
++    for (int i = 0; i < frames * 2; i++) { float v = out[i] * 32767.f; o16[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v); }
++#else
++    for (int i = 0; i < frames * 2; i++) out[i] = std::max(-1.f, std::min(1.f, out[i]));
++#endif
+ }
+ 
+ // ---- output device
+@@ -308,6 +309,10 @@ static bool openDevice(const std::string& name) {
+     want.freq = (kIsAndroid || kIsSwitch) ? 48000 : kRate; want.format = kIsPsp ? AUDIO_S16SYS : AUDIO_F32SYS; want.channels = 2; want.samples = kIsAndroid ? 512 : 1024; want.callback = mix;   // (Android: ~11 ms)
+ #ifdef ISAAC_FUNKEY
+     static int s_speaker = 1; want.userdata = &s_speaker;   // (the device's mix goes to the FunKey's speaker: see mix())
++    // 16-bit samples: FunKey-OS's default device is a route plugin, which converted every float sample (1.4% of the
++    // game's time in alsa-lib). (Straight to the codec, hw:0, cost more: the sound thread woke far more often, +0.75 ms
++    // per tick in the kernel.)
++    want.format = AUDIO_S16SYS;
+ #endif
+     SDL_AudioDeviceID d = SDL_OpenAudioDevice(name.empty() ? nullptr : name.c_str(), 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+     if (!d) { logf("audio: %s: %s\n", name.empty() ? "default device" : name.c_str(), SDL_GetError()); return false; }
+diff --git a/rt/funkey.cpp b/rt/funkey.cpp
+index 4f2a364..040b838 100644
+--- a/rt/funkey.cpp
++++ b/rt/funkey.cpp
+@@ -44,6 +44,9 @@
+ #include <ucontext.h>
+ #include <unistd.h>
+ #include <dirent.h>
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
+ #include <algorithm>
+ #include <atomic>
+ #include <cerrno>
+@@ -150,7 +153,25 @@ void fbPresent(const uint32_t* px, int w, int h) {
+         if (g_fb.bpp == 16) {
+             uint16_t* d = (uint16_t*)(g_fb.mem + (size_t)y * g_fb.line);
+             const uint8_t* bay = kBayer[y & 3];
+-            for (int x = 0; x < cw; x++) {
++            int x = 0;
++#if defined(__ARM_NEON)
++            // 8 pixels a step, the same result as below: saturating add of the dither, then the top 5/6/5 bits
++            // inserted into one 16-bit word (VSRI)
++            uint8x8_t dr, dg;
++            {
++                uint8_t t8[8], g8[8];
++                for (int k = 0; k < 8; k++) { t8[k] = (uint8_t)(bay[k & 3] >> 1); g8[k] = (uint8_t)(bay[k & 3] >> 2); }
++                dr = vld1_u8(t8); dg = vld1_u8(g8);
++            }
++            for (; x + 8 <= cw; x += 8) {
++                uint8x8x4_t p = vld4_u8((const uint8_t*)(s + x));   // (memory order B, G, R, A)
++                uint16x8_t r = vshll_n_u8(vqadd_u8(p.val[2], dr), 8);
++                uint16x8_t g = vshll_n_u8(vqadd_u8(p.val[1], dg), 8);
++                uint16x8_t b = vshll_n_u8(vqadd_u8(p.val[0], dr), 8);
++                vst1q_u16(d + x, vsriq_n_u16(vsriq_n_u16(r, g, 5), b, 11));
++            }
++#endif
++            for (; x < cw; x++) {
+                 uint32_t c = s[x], t = bay[x & 3];
+                 uint32_t r = ((c >> 16) & 255) + (t >> 1), g = ((c >> 8) & 255) + (t >> 2), b = (c & 255) + (t >> 1);
+                 if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
+diff --git a/rt/platform.cpp b/rt/platform.cpp
+index 323e4af..8d13648 100644
+--- a/rt/platform.cpp
++++ b/rt/platform.cpp
+@@ -49,6 +49,14 @@ void platformInitLimits() {
+     // PSP (2000 and later): ~50 MB for everything. No GPU-side layers, a few atlas pages (see render_psp.cpp).
+     // FunKey S: ~46 MB for everything, and no GPU either: the PSP's limits to begin with
+     g_lim = {15000, 4u << 20, 1u << 20, 2u << 20, 0, 0, 0, 6, 2.0, true, 1.4};   // (objects ~200 bytes: collect early)
++#if defined(ISAAC_FUNKEY)
++    // The leaves drawn into BitmapData (each room's floor and walls are drawn into the room's bitmap when it is entered:
++    // 80-110 shapes): with 2 MB they were rasterized again in every room, with 6 MB most rooms reuse the floor's
++    // (a room's drawing 40% shorter on average, many rooms near nothing; 16 MB does no better). The renderer's own
++    // cache went from 8 to 4 MB for it (its graphics are smaller at the FunKey picture scale).
++    g_lim.leafBudgetBytes = 6u << 20;
++    if (const char* e = getenv("ISAAC_LEAF_KB")) g_lim.leafBudgetBytes = (size_t)atol(e) << 10;   // (testing)
++#endif
+ #elif defined(FL_SWITCH_MEMORY)
+     g_lim = kSmall;
+ #else
+diff --git a/rt/render_soft.cpp b/rt/render_soft.cpp
+index 569bcf1..b4fde46 100644
+--- a/rt/render_soft.cpp
++++ b/rt/render_soft.cpp
+@@ -41,7 +41,8 @@ using Clock = std::chrono::steady_clock;
+ double msSince(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+ 
+ // ---------------------------------------------------------------- frame buffers
+-int g_cw = 0, g_ch = 0;                 // the canvas: the stage, 1:1
++int g_cw = 0, g_ch = 0;                 // the canvas: the stage at g_cs (the picture's size, or the stage's, see renderFrame)
++float g_cs = 1;                         // stage pixels -> canvas pixels
+ std::vector<uint32_t> g_canvas;         // premultiplied ARGB (0xAARRGGBB), opaque once the background is in
+ std::vector<uint8_t> g_stencil;         // mask nesting per pixel (0 outside every mask)
+ bool g_stencilUsed = false;
+@@ -99,17 +100,21 @@ PixCx pixCx(const CX& cx) {
+     p.ra = cx.ra / 255.f; p.ga = cx.ga / 255.f; p.ba = cx.ba / 255.f; p.aa = cx.aa / 255.f;
+     return p;
+ }
++// 1 / alpha (alpha 1..255): un-premultiplying a channel is a multiplication, not a division
++struct InvAlpha { float v[256]; InvAlpha() { v[0] = 0; for (int i = 1; i < 256; i++) v[i] = 1.f / (float)i; } };
++const InvAlpha g_invAlpha;
+ inline uint32_t applyCx(uint32_t s, const PixCx& c) {
+     if (c.kind == 1) {
+         uint32_t a = ((s >> 24) * c.ma + 128) >> 8, r = (((s >> 16) & 255) * c.mr + 128) >> 8;
+         uint32_t g = (((s >> 8) & 255) * c.mg + 128) >> 8, b = ((s & 255) * c.mb + 128) >> 8;
+         return a << 24 | r << 16 | g << 8 | b;
+     }
+-    float a = (s >> 24) / 255.f;
+-    if (a <= 0) return 0;   // (a transparent pixel stays transparent: its alpha offset is scaled by its coverage)
++    uint32_t A = s >> 24;
++    if (!A) return 0;   // (a transparent pixel stays transparent: its alpha offset is scaled by its coverage)
+     auto cl = [](float v) { return v < 0 ? 0.f : v > 1 ? 1.f : v; };
+-    float r = cl(((s >> 16) & 255) / 255.f / a * c.rm + c.ra), g = cl(((s >> 8) & 255) / 255.f / a * c.gm + c.ga);
+-    float b = cl((s & 255) / 255.f / a * c.bm + c.ba);
++    float ia = g_invAlpha.v[A], a = (float)A * (1.f / 255.f);   // (channel / 255 / (A / 255) = channel / A)
++    float r = cl((float)((s >> 16) & 255) * ia * c.rm + c.ra), g = cl((float)((s >> 8) & 255) * ia * c.gm + c.ga);
++    float b = cl((float)(s & 255) * ia * c.bm + c.ba);
+     float na = cl(a * c.am + c.aa * a);
+     auto q = [](float v) { return (uint32_t)(v * 255.f + 0.5f); };
+     return q(na) << 24 | q(r * na) << 16 | q(g * na) << 8 | q(b * na);
+@@ -126,6 +131,26 @@ inline void blendOver(uint32_t& d, uint32_t s) {
+     ag = ((ag + 0x00800080u + ((ag >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
+     d = s + (rb | ag << 8);
+ }
++// a row of premultiplied pixels over the destination: blendOver on each, 8 at a time with NEON (the same results:
++// d * (255 - a) / 255 rounded as (x + 128 + (x >> 8)) >> 8, which also leaves d as it is where s is 0 and gives s
++// where a is 255). rev: the source is read backwards from src (mirrored drawing).
++inline void blendRow(uint32_t* dst, const uint32_t* src, int n, bool rev = false) {
++    int i = 0;
++#if defined(__ARM_NEON)
++    for (; i + 8 <= n; i += 8) {
++        uint8x8x4_t s = vld4_u8((const uint8_t*)(rev ? src - i - 7 : src + i));
++        if (rev) for (int c = 0; c < 4; c++) s.val[c] = vrev64_u8(s.val[c]);
++        uint8x8x4_t d = vld4_u8((const uint8_t*)(dst + i));
++        uint8x8_t ia = vmvn_u8(s.val[3]);
++        for (int c = 0; c < 4; c++) {
++            uint16x8_t x = vmull_u8(d.val[c], ia);
++            d.val[c] = vadd_u8(s.val[c], vrshrn_n_u16(vsraq_n_u16(x, x, 8), 8));
++        }
++        vst4_u8((uint8_t*)(dst + i), d);
++    }
++#endif
++    for (; i < n; i++) blendOver(dst[i], rev ? src[-i] : src[i]);
++}
+ // a + (b - a) * t / 256 on all four channels (t 0..256)
+ inline uint32_t lerpPx(uint32_t a, uint32_t b, uint32_t t) {
+     uint32_t it = 256 - t;
+@@ -229,20 +254,19 @@ void drawTex(const Tex& t, const FMat& A, const CX& cxIn, Mode mode, bool smooth
+                     if (!fx) {
+                         const uint32_t* s = row + (D0 - ox);
+                         if (plain && sg->opaque) memcpy(dst + D0, s, (size_t)(D1 - D0) * 4);
+-                        else if (plain) for (int X = D0; X < D1; X++, s++) blendOver(dst[X], *s);
++                        else if (plain) blendRow(dst + D0, s, D1 - D0);
+                         else for (int X = D0; X < D1; X++, s++) { if (*s) putPixel(Y * g_cw + X, *s, cx, mode); }
+                     } else {
+                         const uint32_t* s = row + (ox - 1 - D0);
+                         if (plain && sg->opaque) for (int X = D0; X < D1; X++, s--) dst[X] = *s;
+-                        else if (plain) for (int X = D0; X < D1; X++, s--) blendOver(dst[X], *s);
++                        else if (plain) blendRow(dst + D0, s, D1 - D0, true);
+                         else for (int X = D0; X < D1; X++, s--) { if (*s) putPixel(Y * g_cw + X, *s, cx, mode); }
+                     }
+                 }
+                 continue;
+             }
+             if (plain) {
+-                if (!fx) { const uint32_t* s = row + (X0 - ox); for (int X = X0; X < X1; X++, s++) { uint32_t p = *s; if (p >= 0xff000000u) dst[X] = p; else if (p) blendOver(dst[X], p); } }
+-                else { const uint32_t* s = row + (ox - 1 - X0); for (int X = X0; X < X1; X++, s--) { uint32_t p = *s; if (p >= 0xff000000u) dst[X] = p; else if (p) blendOver(dst[X], p); } }
++                if (X1 > X0) blendRow(dst + X0, fx ? row + (ox - 1 - X0) : row + (X0 - ox), X1 - X0, fx);
+                 continue;
+             }
+             for (int X = X0; X < X1; X++) {
+@@ -272,8 +296,39 @@ void drawTex(const Tex& t, const FMat& A, const CX& cxIn, Mode mode, bool smooth
+         int X0 = bx0 + (int)k0, X1 = std::min(bx1, bx0 + (int)k1);
+         int32_t fu = (int32_t)std::lround((su + I.a * k0) * one), fv = (int32_t)std::lround((sv + I.b * k0) * one);
+         uint32_t* dstRow = &g_canvas[(size_t)Y * g_cw];
++        const bool plainSmooth = smooth && mode == M_DRAW && !g_level && !cx.kind;
+         for (int X = X0; X < X1; X++, fu += du, fv += dv) {
+             uint32_t p;
++            // The span where all four texels of the sample are inside the texture (one span: the sample moves in a
++            // straight line): computed into a row without the edge checks, then blended in one go (blendRow). The
++            // same arithmetic as lerpPx: (a * (256 - t) + b * t) >> 8 per channel, horizontally then vertically.
++            if (plainSmooth && (unsigned)(fu >> 16) < (unsigned)(t.w - 1) && (unsigned)(fv >> 16) < (unsigned)(t.h - 1)) {
++                static uint32_t s_row[8192];
++                int n = 0;
++                const int maxN = std::min(X1 - X, 8192);
++                while (n < maxN) {
++                    int iu = fu >> 16, iv = fv >> 16;
++                    if ((unsigned)iu >= (unsigned)(t.w - 1) || (unsigned)iv >= (unsigned)(t.h - 1)) break;
++                    const uint32_t* r0 = t.px + (size_t)iv * t.stride + iu;
++                    uint32_t wu = ((uint32_t)fu >> 8) & 255, wv = ((uint32_t)fv >> 8) & 255;
++#if defined(__ARM_NEON)
++                    uint16x8_t top = vmovl_u8(vreinterpret_u8_u32(vld1_u32(r0)));               // p00 | p10
++                    uint16x8_t bot = vmovl_u8(vreinterpret_u8_u32(vld1_u32(r0 + t.stride)));    // p01 | p11
++                    uint16x8_t wh = vcombine_u16(vdup_n_u16((uint16_t)(256 - wu)), vdup_n_u16((uint16_t)wu));
++                    top = vmulq_u16(top, wh); bot = vmulq_u16(bot, wh);
++                    uint16x4_t ht = vshr_n_u16(vadd_u16(vget_low_u16(top), vget_high_u16(top)), 8);
++                    uint16x4_t hb = vshr_n_u16(vadd_u16(vget_low_u16(bot), vget_high_u16(bot)), 8);
++                    uint16x4_t v = vshr_n_u16(vmla_u16(vmul_u16(ht, vdup_n_u16((uint16_t)(256 - wv))), hb, vdup_n_u16((uint16_t)wv)), 8);
++                    s_row[n] = vget_lane_u32(vreinterpret_u32_u8(vmovn_u16(vcombine_u16(v, v))), 0);
++#else
++                    s_row[n] = lerpPx(lerpPx(r0[0], r0[1], wu), lerpPx(r0[t.stride], r0[t.stride + 1], wu), wv);
++#endif
++                    n++; fu += du; fv += dv;
++                }
++                blendRow(dstRow + X, s_row, n);
++                X += n - 1; fu -= du; fv -= dv;   // (the loop's increments follow)
++                continue;
++            }
+             if (smooth) {
+                 int iu = fu >> 16, iv = fv >> 16;   // (arithmetic shifts: floor)
+                 if (iu < -1 || iv < -1 || iu >= t.w || iv >= t.h) continue;
+@@ -371,18 +426,21 @@ std::unordered_map<BigKey, Entry, BigKeyHash> g_big;
+ size_t g_bigBytes = 0;
+ const size_t kBigBudget = 3u << 20;
+ 
+-// Whether a display object is where it was in the previous frame (same transform, to 1/4096 and 1/16 px). A large
+-// graphic that is stretched or turned (so its raster can't be copied 1:1) but doesn't move is rasterized at that
+-// very transform once (bigRasterFor) and copied from then on; one that moves is resampled every frame.
+-struct LastM { int32_t q[6]; uint32_t frame = 0; bool still = false; };
++// Whether a display object shows what it showed in the previous frame, where it was (the same graphic, and the same
++// transform to 1/4096 and 1/16 px). A large graphic that is stretched or turned (so its raster can't be copied 1:1)
++// but doesn't change is rasterized at that very transform once (bigRasterFor) and copied from then on; one that
++// moves is resampled every frame. So is one that animates in place: an animation's frames are different graphics
++// (a turning swirl showed a new one at its transform almost every frame, each rasterized at that transform: about
++// one rasterization per picture in the floors, 2-3 ms each on the FunKey), and the shape cache keeps them all.
++struct LastM { int32_t q[6]; const void* def = nullptr; uint32_t variant = 0, frame = 0; bool still = false; };
+ std::unordered_map<uint32_t, LastM> g_lastM;   // by display object uid
+-bool stillTransform(uint32_t uid, const FMat& m) {
++bool stillTransform(uint32_t uid, const FMat& m, const void* def, uint32_t variant) {
+     LastM& l = g_lastM[uid];
+     if (l.frame == g_frameNo) return l.still;   // (decided once per frame: a mask is drawn twice, and both must match)
+     int32_t q[6] = {(int32_t)std::lround(m.a * 4096), (int32_t)std::lround(m.b * 4096), (int32_t)std::lround(m.c * 4096),
+                     (int32_t)std::lround(m.d * 4096), (int32_t)std::lround(m.tx * 16), (int32_t)std::lround(m.ty * 16)};
+-    l.still = l.frame && l.frame + 1 == g_frameNo && !memcmp(l.q, q, sizeof q);
+-    memcpy(l.q, q, sizeof q); l.frame = g_frameNo;
++    l.still = l.frame && l.frame + 1 == g_frameNo && !memcmp(l.q, q, sizeof q) && l.def == def && l.variant == variant;
++    memcpy(l.q, q, sizeof q); l.def = def; l.variant = variant; l.frame = g_frameNo;
+     return l.still;
+ }
+ Entry* bigRasterFor(const SnapNode& n, const FMat& m, int x0, int y0, int w, int h) {
+@@ -402,6 +460,9 @@ Entry* bigRasterFor(const SnapNode& n, const FMat& m, int x0, int y0, int w, int
+     else buildRuns(e.r.px.data(), e.r.w, e.r.h, e.r.w, e.runs);
+     double ms = msSince(t0);
+     g_rstats.rasters++; g_rstats.rasterMs += ms; g_rasterSpentMs += ms;
++    static const bool log = getenv("ISAAC_SOFT_RASTERLOG") != nullptr;   // (testing) every graphic rasterized
++    if (log) logf("[raster] frame %u: char %u kind %d variant %u at transform %.3f %.3f %.3f %.3f %.2f %.2f box %d,%d %dx%d -> %dx%d in %.2f ms (big cache %zu KB, %zu entries)\n",
++                  g_frameNo, (unsigned)n.def->id, n.objKind, variant, m.a, m.b, m.c, m.d, m.tx, m.ty, x0, y0, w, h, e.r.w, e.r.h, ms, g_bigBytes >> 10, g_big.size());
+     e.bytes = e.r.px.size() * 4 + runsBytes(e.runs) + 64;
+     // (the oldest go first; those of this frame stay)
+     while (g_bigBytes + e.bytes > kBigBudget) {
+@@ -433,6 +494,34 @@ const Runs* bitmapRuns(const SnapNode& n) {
+     return &b.runs;
+ }
+ 
++// ---------------------------------------------------------------- BitmapData drawn 1:1 on the stage, on a smaller canvas
++// The game's stage-sized layers (floor and walls, blood, gibs, the minimap) are drawn at the stage's scale. On a canvas
++// smaller than the stage they're drawn 1:1 from a copy shrunk by area averaging (as the whole canvas was shrunk before),
++// made again only when the bitmap changes: 4% of the times they're drawn in the floors. One that changes in consecutive
++// frames is resampled directly instead.
++void scaleImage(const uint32_t* src, int sw, int sh, int sstride, uint32_t* dst, int dw, int dh, int dstride, bool opaque);
++struct Layer { uint32_t version = 0, lastUse = 0, lastChange = 0; int w = 0, h = 0, dw = 0, dh = 0, streak = 0; float cs = 0; bool built = false; std::vector<uint32_t> px; Runs runs; };
++std::unordered_map<uint32_t, Layer> g_layers;   // by BitmapData uid
++const Layer* layerFor(const SnapNode& n) {
++    Layer& L = g_layers[n.bmUid];
++    L.lastUse = g_frameNo;
++    bool changed = L.version != n.bmVersion || L.w != n.bmW || L.h != n.bmH;
++    if (changed) {
++        L.streak = L.lastChange + 1 == g_frameNo ? L.streak + 1 : 0;
++        L.lastChange = g_frameNo; L.version = n.bmVersion; L.w = n.bmW; L.h = n.bmH; L.built = false;
++        if (L.streak >= 2) { L.px.clear(); L.px.shrink_to_fit(); return nullptr; }   // (changing every frame)
++    }
++    if (!L.built || L.cs != g_cs) {
++        L.cs = g_cs;
++        L.dw = std::max(1, (int)std::lround(n.bmW * g_cs)); L.dh = std::max(1, (int)std::lround(n.bmH * g_cs));
++        L.px.resize((size_t)L.dw * L.dh);
++        scaleImage(n.bmPx, n.bmW, n.bmH, n.bmW, L.px.data(), L.dw, L.dh, L.dw, false);
++        buildRuns(L.px.data(), L.dw, L.dh, L.dw, L.runs);
++        L.built = true;
++    }
++    return &L;
++}
++
+ // ---------------------------------------------------------------- the display list
+ // the canvas pixels a rectangle of local space covers (clipped to the canvas, with a 2 px margin)
+ bool canvasBox(const FMat& m, const RectF& b, int& x0, int& y0, int& x1, int& y1) {
+@@ -485,6 +574,30 @@ void drawNode(uint32_t i, const FMat& parent, const CX& pcx, Mode mode) {
+         case SN_CONTAINER: drawChildren(i, m, cx, mode); break;
+         case SN_BITMAP: {
+             if (!n.bmPx) break;
++            static const bool bmLog = getenv("ISAAC_SOFT_BMLOG") != nullptr;   // (testing) which bitmaps are drawn, how often they change
++            if (bmLog && mode == M_DRAW) {
++                struct S { int w, h, draws = 0, changes = 0; uint32_t ver = 0; float a, d; };
++                static std::unordered_map<uint32_t, S> s_bm; static uint32_t s_from = 0;
++                auto it = s_bm.find(n.bmUid);
++                if (it == s_bm.end()) it = s_bm.emplace(n.bmUid, S{n.bmW, n.bmH, 0, 0, n.bmVersion, m.a, m.d}).first;
++                S& s = it->second; s.draws++; if (s.ver != n.bmVersion) { s.changes++; s.ver = n.bmVersion; } s.a = m.a; s.d = m.d;
++                if (g_frameNo >= s_from + 300) {
++                    for (auto& kv : s_bm) logf("[bm] frames %u-%u: bitmap %u %dx%d drawn %d, changed %d, scale %.3f %.3f\n", s_from, g_frameNo, kv.first,
++                                               kv.second.w, kv.second.h, kv.second.draws, kv.second.changes, kv.second.a, kv.second.d);
++                    s_bm.clear(); s_from = g_frameNo;
++                }
++            }
++            // at the stage's scale on a smaller canvas: from its shrunk copy, 1:1 (see layerFor)
++            const float tol = 1e-3f * g_cs;
++            if (g_cs < 0.999f && std::fabs(m.b) < tol && std::fabs(m.c) < tol && std::fabs(m.a - g_cs) < tol && std::fabs(m.d - g_cs) < tol &&
++                n.bmW >= 16 && n.bmH >= 16) {
++                if (const Layer* L = layerFor(n)) {
++                    Tex t{L->px.data(), L->dw, L->dh, L->dw, &L->runs};
++                    drawTex(t, FMat(1, 0, 0, 1, m.tx, m.ty), cx, mode, true);
++                    g_rstats.draws++;
++                    break;
++                }
++            }
+             Tex t{n.bmPx, n.bmW, n.bmH, n.bmW, bitmapRuns(n)};
+             drawTex(t, m, cx, mode, n.smoothing || maxScale(m) < 0.999f);
+             g_rstats.draws++;
+@@ -517,7 +630,8 @@ void drawNode(uint32_t i, const FMat& parent, const CX& pcx, Mode mode) {
+             const float kEps = 1e-3f;
+             bool oneToOne = std::fabs(A.b) < kEps && std::fabs(A.c) < kEps && std::fabs(std::fabs(A.a) - 1) < kEps && std::fabs(std::fabs(A.d) - 1) < kEps;
+             // large, stretched or turned, and still: once at its transform rather than resampled every frame
+-            if (!oneToOne && n.hasBounds && (x1 - x0) * (y1 - y0) >= 4096 && stillTransform(n.uid, m)) { atTransform(); break; }
++            if (!oneToOne && n.hasBounds && (x1 - x0) * (y1 - y0) >= 4096 &&
++                stillTransform(n.uid, m, n.def, n.objKind == OK_EDITTEXT ? n.textVersion : n.objKind == OK_MORPH ? (uint32_t)(n.ratio & 0xffc0) : 0)) { atTransform(); break; }
+             Tex t{r.px.data(), r.w, r.h, r.w, &e->runs};
+             drawTex(t, A, cx, mode, true);
+             g_rstats.draws++;
+@@ -530,7 +644,6 @@ void drawNode(uint32_t i, const FMat& parent, const CX& pcx, Mode mode) {
+ // Area averaging (downscaling: every source pixel counts for the part of it each output pixel covers), linear when
+ // enlarging. Weights in 1/256, at most 4 source pixels per output pixel and axis.
+ struct Taps { int src = 0, n = 0; uint16_t w[4] = {}; };
+-std::vector<Taps> g_tapsX, g_tapsY; int g_tapsFor[4] = {};
+ void buildTaps(int srcN, int dstN, std::vector<Taps>& out) {
+     out.assign(dstN, Taps());
+     double sc = (double)srcN / dstN;
+@@ -555,34 +668,54 @@ void outRect(int& x0, int& y0, int& w, int& h) {
+     if (g_softStretch) { x0 = 0; y0 = 0; w = g_winW; h = g_winH; return; }
+     Mat st = stageToWindowFor(g_winW, g_winH);
+     x0 = (int)st.tx; y0 = (int)st.ty;
+-    w = std::min(g_winW - x0, (int)std::lround(g_cw * st.a)); h = std::min(g_winH - y0, (int)std::lround(g_ch * st.d));
++    w = std::min(g_winW - x0, (int)std::lround(g_stageW * st.a)); h = std::min(g_winH - y0, (int)std::lround(g_stageH * st.d));
+ }
+-void scaleCanvas() {
+-    int ox, oy, ow, oh; outRect(ox, oy, ow, oh);
+-    if (ow <= 0 || oh <= 0) return;
+-    if (g_tapsFor[0] != g_cw || g_tapsFor[1] != g_ch || g_tapsFor[2] != ow || g_tapsFor[3] != oh) {
+-        buildTaps(g_cw, ow, g_tapsX); buildTaps(g_ch, oh, g_tapsY);
+-        g_tapsFor[0] = g_cw; g_tapsFor[1] = g_ch; g_tapsFor[2] = ow; g_tapsFor[3] = oh;
++// The weights of one axis (srcN -> dstN), kept by size. For the horizontal pass, when no output pixel takes more than 3
++// source pixels (the FunKey's 363 -> 240): in 1/128 like the vertical pass, one 16-byte vector per output pixel (each
++// weight for the 4 bytes of its source pixel, the 4th pixel's 0), so that NEON weighs the 4 source pixels one load
++// reads in one go.
++struct alignas(16) W16 { uint8_t b[16]; };
++struct Axis { std::vector<Taps> t; std::vector<W16> hw; bool hw3 = true; };
++const Axis& axisFor(int srcN, int dstN) {
++    static std::unordered_map<uint64_t, Axis> s_axes;
++    uint64_t key = (uint64_t)(uint32_t)srcN << 32 | (uint32_t)dstN;
++    auto it = s_axes.find(key);
++    if (it != s_axes.end()) return it->second;
++    Axis& a = s_axes[key];
++    buildTaps(srcN, dstN, a.t);
++    a.hw.assign(a.t.size(), W16{});
++    for (size_t x = 0; x < a.t.size(); x++) {
++        const Taps& t = a.t[x];
++        if (t.n > 3) { a.hw3 = false; break; }
++        uint8_t b7 = (uint8_t)((t.w[1] + 1) >> 1), c7 = (uint8_t)((t.w[2] + 1) >> 1), a7 = (uint8_t)(128 - b7 - c7);
++        for (int k = 0; k < 4; k++) { a.hw[x].b[k] = a7; a.hw[x].b[4 + k] = b7; a.hw[x].b[8 + k] = c7; }
+     }
+-    // Vertically first: whole rows of the canvas at a time (16 bytes per NEON step on the console), into oh rows of the
+-    // canvas's width plus 2 spare pixels, so that the horizontal pass can always read three. Weights in 1/128 there
+-    // (three byte products then fit 16 bits), the same on every machine so that screenshots compare.
+-    const int tw = g_cw + 2;
+-    g_tmp.resize((size_t)oh * tw);
+-    for (int y = 0; y < oh; y++) {
+-        const Taps& t = g_tapsY[y];
++    return a;
++}
++// An image (premultiplied ARGB, sw x sh, rows sstride pixels apart) scaled into another (dw x dh, rows dstride apart).
++// Vertically first: whole rows at a time (16 bytes per NEON step on the console), into dh rows of the source's width
++// plus 2 spare pixels, so that the horizontal pass can always read three (four with NEON). Weights in 1/128 there
++// (three byte products then fit 16 bits), the same on every machine so that screenshots compare. opaque: alpha 255 in
++// the output (the canvas), else the averaged alpha (premultiplied: averaging is right as it is).
++void scaleImage(const uint32_t* src, int sw, int sh, int sstride, uint32_t* dst, int dw, int dh, int dstride, bool opaque) {
++    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
++    const Axis& ax = axisFor(sw, dw); const Axis& ay = axisFor(sh, dh);
++    const int tw = sw + 2;
++    g_tmp.resize((size_t)dh * tw + 4);   // (+4: the horizontal pass reads 4 pixels from the last source pixel used)
++    for (int y = 0; y < dh; y++) {
++        const Taps& t = ay.t[y];
+         uint32_t* d = &g_tmp[(size_t)y * tw];
+-        const uint32_t* r0 = &g_canvas[(size_t)t.src * g_cw];
++        const uint32_t* r0 = src + (size_t)t.src * sstride;
+         int x = 0;
+         if (t.n <= 3) {
+-            const uint32_t* r1 = t.n > 1 ? r0 + g_cw : r0;
+-            const uint32_t* r2 = t.n > 2 ? r0 + 2 * g_cw : r0;
++            const uint32_t* r1 = t.n > 1 ? r0 + sstride : r0;
++            const uint32_t* r2 = t.n > 2 ? r0 + 2 * sstride : r0;
+             uint32_t b7 = (t.w[1] + 1) >> 1, c7 = (t.w[2] + 1) >> 1, a7 = 128 - b7 - c7;
+ #if defined(__ARM_NEON)
+             uint8x8_t va = vdup_n_u8((uint8_t)a7), vb = vdup_n_u8((uint8_t)b7), vc = vdup_n_u8((uint8_t)c7);
+             const uint8_t* p0 = (const uint8_t*)r0; const uint8_t* p1 = (const uint8_t*)r1; const uint8_t* p2 = (const uint8_t*)r2;
+             uint8_t* pd = (uint8_t*)d;
+-            int nb = g_cw * 4, i = 0;
++            int nb = sw * 4, i = 0;
+             for (; i + 16 <= nb; i += 16) {
+                 uint8x16_t x0 = vld1q_u8(p0 + i), x1 = vld1q_u8(p1 + i), x2 = vld1q_u8(p2 + i);
+                 uint16x8_t lo = vmull_u8(vget_low_u8(x0), va); lo = vmlal_u8(lo, vget_low_u8(x1), vb); lo = vmlal_u8(lo, vget_low_u8(x2), vc);
+@@ -592,36 +725,73 @@ void scaleCanvas() {
+             x = i / 4;
+ #endif
+             // (two channels per 32-bit word, R and B, A and G: each 16-bit lane holds at most 255 * 128 + 64)
+-            for (; x < g_cw; x++) {
++            for (; x < sw; x++) {
+                 uint32_t p = r0[x], q = r1[x], s = r2[x];
+                 uint32_t rb = 0x00400040u + (p & 0x00ff00ffu) * a7 + (q & 0x00ff00ffu) * b7 + (s & 0x00ff00ffu) * c7;
+                 uint32_t ag = 0x00400040u + ((p >> 8) & 0x00ff00ffu) * a7 + ((q >> 8) & 0x00ff00ffu) * b7 + ((s >> 8) & 0x00ff00ffu) * c7;
+                 d[x] = ((rb >> 7) & 0x00ff00ffu) | ((ag << 1) & 0xff00ff00u);
+             }
+-        } else {   // (shrinking more than 3 times: not the FunKey's 272 -> 180)
+-            for (; x < g_cw; x++) {
++        } else {   // (shrinking more than 3 times)
++            for (; x < sw; x++) {
+                 uint32_t rb = 0x00800080u, ag = 0x00800080u;
+-                for (int k = 0; k < t.n; k++) { uint32_t p = r0[(size_t)k * g_cw + x], w = t.w[k]; rb += (p & 0x00ff00ffu) * w; ag += ((p >> 8) & 0x00ff00ffu) * w; }
++                for (int k = 0; k < t.n; k++) { uint32_t p = r0[(size_t)k * sstride + x], w = t.w[k]; rb += (p & 0x00ff00ffu) * w; ag += ((p >> 8) & 0x00ff00ffu) * w; }
+                 d[x] = ((rb >> 8) & 0x00ff00ffu) | (ag & 0xff00ff00u);
+             }
+         }
+-        d[g_cw] = d[g_cw + 1] = d[g_cw - 1];
++        d[sw] = d[sw + 1] = d[sw - 1];
+     }
+-    // then horizontally, into the output: three taps always (weights 0 past the ones used), in 1/256
+-    for (int y = 0; y < oh; y++) {
++    // then horizontally, into the output: three taps always (weights 0 past the ones used); in 1/128 (Axis::hw) when no
++    // output pixel takes more than 3 source pixels, else in 1/256
++    const uint32_t amask = opaque ? 0xff000000u : 0;
++    for (int y = 0; y < dh; y++) {
+         const uint32_t* s = &g_tmp[(size_t)y * tw];
+-        uint32_t* d = &g_win[(size_t)(oy + y) * g_winW + ox];
+-        for (int x = 0; x < ow; x++) {
+-            const Taps& t = g_tapsX[x];
++        uint32_t* d = dst + (size_t)y * dstride;
++        if (ax.hw3) {
++            int x = 0;
++#if defined(__ARM_NEON)
++            const uint32x2_t am = vdup_n_u32(amask);
++            for (; x + 2 <= dw; x += 2) {   // two output pixels a step
++                uint8x16_t p0 = vld1q_u8((const uint8_t*)(s + ax.t[x].src)), w0 = vld1q_u8(ax.hw[x].b);
++                uint8x16_t p1 = vld1q_u8((const uint8_t*)(s + ax.t[x + 1].src)), w1 = vld1q_u8(ax.hw[x + 1].b);
++                uint16x8_t l0 = vmull_u8(vget_low_u8(p0), vget_low_u8(w0)), h0 = vmull_u8(vget_high_u8(p0), vget_high_u8(w0));
++                uint16x8_t l1 = vmull_u8(vget_low_u8(p1), vget_low_u8(w1)), h1 = vmull_u8(vget_high_u8(p1), vget_high_u8(w1));
++                uint16x4_t s0 = vadd_u16(vadd_u16(vget_low_u16(l0), vget_high_u16(l0)), vget_low_u16(h0));
++                uint16x4_t s1 = vadd_u16(vadd_u16(vget_low_u16(l1), vget_high_u16(l1)), vget_low_u16(h1));
++                uint8x8_t px = vrshrn_n_u16(vcombine_u16(s0, s1), 7);
++                vst1_u32(d + x, vorr_u32(vreinterpret_u32_u8(px), am));
++            }
++#endif
++            for (; x < dw; x++) {   // (the same sums: each 16-bit lane at most 255 * 128 + 64)
++                const uint32_t* p = s + ax.t[x].src; const uint8_t* w = ax.hw[x].b;
++                uint32_t a7 = w[0], b7 = w[4], c7 = w[8];
++                uint32_t rb = 0x00400040u + (p[0] & 0x00ff00ffu) * a7 + (p[1] & 0x00ff00ffu) * b7 + (p[2] & 0x00ff00ffu) * c7;
++                uint32_t ag = 0x00400040u + ((p[0] >> 8) & 0x00ff00ffu) * a7 + ((p[1] >> 8) & 0x00ff00ffu) * b7 + ((p[2] >> 8) & 0x00ff00ffu) * c7;
++                d[x] = amask | ((rb >> 7) & 0x00ff00ffu) | ((ag << 1) & 0xff00ff00u);
++            }
++            continue;
++        }
++        for (int x = 0; x < dw; x++) {
++            const Taps& t = ax.t[x];
+             const uint32_t* p = s + t.src;
+             uint32_t w0 = t.w[0], w1 = t.w[1], w2 = t.w[2];
+             uint32_t rb = 0x00800080u + (p[0] & 0x00ff00ffu) * w0 + (p[1] & 0x00ff00ffu) * w1 + (p[2] & 0x00ff00ffu) * w2;
+             uint32_t ag = 0x00800080u + ((p[0] >> 8) & 0x00ff00ffu) * w0 + ((p[1] >> 8) & 0x00ff00ffu) * w1 + ((p[2] >> 8) & 0x00ff00ffu) * w2;
+             if (t.n > 3) { rb += (p[3] & 0x00ff00ffu) * t.w[3]; ag += ((p[3] >> 8) & 0x00ff00ffu) * t.w[3]; }
+-            d[x] = 0xff000000u | ((rb >> 8) & 0x00ff00ffu) | (ag & 0x0000ff00u);
++            d[x] = amask | ((rb >> 8) & 0x00ff00ffu) | (ag & 0xff00ff00u);
+         }
+     }
+ }
++// the canvas into the output: copied when it is the picture's size (drawn at the picture's scale), else scaled
++void scaleCanvas() {
++    int ox, oy, ow, oh; outRect(ox, oy, ow, oh);
++    if (ow <= 0 || oh <= 0) return;
++    uint32_t* out = &g_win[(size_t)oy * g_winW + ox];
++    if (ow == g_cw && oh == g_ch) {
++        for (int y = 0; y < oh; y++) memcpy(out + (size_t)y * g_winW, &g_canvas[(size_t)y * g_cw], (size_t)ow * 4);
++        return;
++    }
++    scaleImage(g_canvas.data(), g_cw, g_ch, g_cw, out, ow, oh, g_winW, true);
++}
+ void fillWin(int x0, int y0, int x1, int y1, uint32_t argb) {
+     x0 = std::max(0, x0); y0 = std::max(0, y0); x1 = std::min(g_winW, x1); y1 = std::min(g_winH, y1);
+     uint32_t a = argb >> 24;
+@@ -660,7 +830,9 @@ void beginFrame(uint32_t clearArgb) {
+ 
+ // ---------------------------------------------------------------- interface (render.h)
+ bool renderInit() {
+-    g_cacheBudget = 8u << 20;   // (a room's graphics at the PSP stage's scale: about 4-6 MB; M3 measures it on the console)
++    // (graphics rasterized at the FunKey's picture scale: in floor 1, as few rasterizations with 5 MB as with 8 MB, 8%
++    // more with 4 MB, 45% more with 3 MB. 4 MB: the memory went to the cache of BitmapData leaves, platform.cpp)
++    g_cacheBudget = 4u << 20;
+     if (const char* e = getenv("ISAAC_SOFT_CACHE_KB")) g_cacheBudget = (size_t)atol(e) << 10;   // (testing)
+     if (getenv("ISAAC_SOFT_STRETCH")) g_softStretch = true;   // (testing: the whole window, like the FunKey's "full")
+     return true;
+@@ -672,7 +844,7 @@ Mat stageToWindowFor(int winW, int winH) {
+ }
+ void renderAdopt(const SnapPtr& s) {   // (BitmapData are drawn from their own pixels: no uploads)
+     g_cur = s;
+-    for (uint32_t uid : s->freedBitmaps) g_bmRuns.erase(uid);
++    for (uint32_t uid : s->freedBitmaps) { g_bmRuns.erase(uid); g_layers.erase(uid); }
+ }
+ void renderFreeRetired() {}
+ const Snapshot* renderCurrent() { return g_cur.get(); }
+@@ -681,20 +853,30 @@ void renderFrame(int winW, int winH, double) {
+     g_winW = winW; g_winH = winH;
+     g_stageToWindow = g_softStretch ? Mat{(double)winW / g_stageW, 0, 0, (double)winH / g_stageH, 0, 0} : stageToWindowFor(winW, winH);
+     if (!g_cur || g_stageW <= 0 || g_stageH <= 0) return;
+-    if (g_cw != g_stageW || g_ch != g_stageH) {
+-        g_cw = g_stageW; g_ch = g_stageH;
++    // The canvas: the stage at the picture's scale when the picture is smaller than the stage (the FunKey: 240x180 for
++    // 363x272), graphics rasterized at their size there; else (or with ISAAC_SOFT_STAGERES) at the stage's own size,
++    // scaled once at the end (renderEndFrame). Full-screen (g_softStretch) draws at the 4:3 scale too and stretches
++    // the rows at the end.
++    static const bool stageRes = getenv("ISAAC_SOFT_STAGERES") != nullptr;
++    double fit = std::min((double)winW / g_stageW, (double)winH / g_stageH);
++    float cs = stageRes || fit >= 1 ? 1.f : (float)fit;
++    int cw = std::max(1, (int)std::lround(g_stageW * cs)), ch = std::max(1, (int)std::lround(g_stageH * cs));
++    if (g_cw != cw || g_ch != ch || g_cs != cs) {
++        g_cw = cw; g_ch = ch; g_cs = cs;
+         g_canvas.assign((size_t)g_cw * g_ch, 0); g_stencil.assign((size_t)g_cw * g_ch, 0);
++        g_layers.clear(); g_cache.clear(); g_cacheBytes = 0; g_big.clear(); g_bigBytes = 0;
+     }
+     if (g_stencilUsed) { std::fill(g_stencil.begin(), g_stencil.end(), 0); g_stencilUsed = false; }
+-    if (g_frameNo % 64 == 0) {   // (runs of BitmapData no longer drawn, transforms of objects gone)
++    if (g_frameNo % 64 == 0) {   // (runs and shrunk copies of BitmapData no longer drawn, transforms of objects gone)
+         for (auto it = g_bmRuns.begin(); it != g_bmRuns.end();) { if (it->second.lastUse + 120 < g_frameNo) it = g_bmRuns.erase(it); else ++it; }
++        for (auto it = g_layers.begin(); it != g_layers.end();) { if (it->second.lastUse + 120 < g_frameNo) it = g_layers.erase(it); else ++it; }
+         for (auto it = g_lastM.begin(); it != g_lastM.end();) { if (it->second.frame + 120 < g_frameNo) it = g_lastM.erase(it); else ++it; }
+     }
+     uint32_t bg = 0xff000000u | (g_cur->bgColor & 0xffffff);
+     std::fill(g_canvas.begin(), g_canvas.end(), bg);
+     g_level = 0; g_rasterSpentMs = 0;
+     auto t0 = Clock::now();
+-    if (!g_cur->nodes.empty()) drawNode(0, FMat(), CX(), M_DRAW);
++    if (!g_cur->nodes.empty()) drawNode(0, FMat(g_cs, 0, 0, g_cs, 0, 0), CX(), M_DRAW);
+     g_rstats.execMs += msSince(t0);
+     g_rstats.nodes = (int)g_cur->nodes.size();
+     g_sceneDrawn = true;
+@@ -705,7 +887,18 @@ void renderFrame(int winW, int winH, double) {
+ }
+ void renderEndFrame() {
+     if (g_winW <= 0 || g_winH <= 0) return;
+-    g_win.assign((size_t)g_winW * g_winH, g_sceneDrawn ? 0xff000000u : g_clearArgb);
++    if (g_sceneDrawn) {   // (only the bars around the picture: the scaled canvas covers the rest)
++        g_win.resize((size_t)g_winW * g_winH);
++        int ox, oy, ow, oh; outRect(ox, oy, ow, oh);
++        ow = std::max(0, ow); oh = std::max(0, oh);
++        uint32_t* w = g_win.data();
++        std::fill(w, w + (size_t)g_winW * oy, 0xff000000u);
++        std::fill(w + (size_t)g_winW * (oy + oh), w + (size_t)g_winW * g_winH, 0xff000000u);
++        for (int y = oy; y < oy + oh; y++) {
++            std::fill(w + (size_t)y * g_winW, w + (size_t)y * g_winW + ox, 0xff000000u);
++            std::fill(w + (size_t)y * g_winW + ox + ow, w + (size_t)(y + 1) * g_winW, 0xff000000u);
++        }
++    } else g_win.assign((size_t)g_winW * g_winH, g_clearArgb);
+     if (g_sceneDrawn) {
+         auto t0 = Clock::now();
+         scaleCanvas();
+@@ -713,7 +906,7 @@ void renderEndFrame() {
+     }
+     if (g_focusOn) {
+         int ox, oy, ow, oh; outRect(ox, oy, ow, oh);
+-        double sx = (double)ow / g_cw, sy = (double)oh / g_ch;
++        double sx = (double)ow / g_stageW, sy = (double)oh / g_stageH;   // (the focus rectangle is in stage pixels)
+         int x0 = ox + (int)std::floor(g_focus[0] * sx), y0 = oy + (int)std::floor(g_focus[1] * sy);
+         int x1 = ox + (int)std::ceil(g_focus[2] * sx), y1 = oy + (int)std::ceil(g_focus[3] * sy);
+         uint32_t c = g_focusStrong ? 0xff8c1212u : 0xffc88888u;
+@@ -790,5 +983,6 @@ int renderAtlasPages() { return (int)(g_cacheBytes >> 20); }
+ void renderMemStats(size_t* pages, size_t* bitmaps) {
+     *pages = g_cacheBytes;
+     *bitmaps = g_canvas.size() * 4 + g_stencil.size() + g_win.size() * 4 + g_tmp.size() * 4;
++    for (auto& kv : g_layers) *bitmaps += kv.second.px.capacity() * 4 + runsBytes(kv.second.runs);   // (the shrunk layers)
+ }
+ }  // namespace fl
+diff --git a/third_party/plutovg/source/plutovg-rasterize.c b/third_party/plutovg/source/plutovg-rasterize.c
+index 559f0ee..65d5643 100644
+--- a/third_party/plutovg/source/plutovg-rasterize.c
++++ b/third_party/plutovg/source/plutovg-rasterize.c
+@@ -189,7 +189,10 @@ static void ft_outline_destroy(PVG_FT_Outline* outline)
+     free(outline);
+ }
+ 
+-#define FT_COORD(x) (PVG_FT_Pos)(roundf(x * 64))
++// (roundf(x * 64) inline: ARMv7 has no rounding instruction, and the library call was 5% of a room's drawing into its
++// bitmaps on the FunKey. Half away from zero, as roundf, for the coordinates' range.)
++static inline PVG_FT_Pos ft_coord(float x) { float v = x * 64; return (PVG_FT_Pos)(v < 0 ? v - 0.5f : v + 0.5f); }
++#define FT_COORD(x) ft_coord(x)
+ static void ft_outline_move_to(PVG_FT_Outline* ft, float x, float y)
+ {
+     ft->points[ft->n_points].x = FT_COORD(x);

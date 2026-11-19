@@ -1,0 +1,479 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Sun, 15 Nov 2026 18:05:06 -0500
+Subject: [PATCH] FunKey S: the FunKey menu (volume, brightness, aspect ratio,
+ FPS, exit game)
+
+Menu opens a menu in the style of FunKey-OS's own emulators' menus (written for this game): one item at a time in a
+light grey box over the darkened game, arrows above and below, Open Sans Bold from the firmware's menu resources (the
+5x7 dots if missing), the next item sliding in at 50 pictures a second. VOLUME and BRIGHTNESS (FunKey-OS's volume and
+brightness commands, one at a time, the last value in the end), ASPECT RATIO (4:3, or STRETCHED across the whole
+screen), SHOW FPS (the pictures of the last second, top left), EXIT GAME ("Are you sure ?", A again). The game, its
+sound (audioSetPaused) and the speaker's amplifier wait meanwhile; the game's clock skips the time spent in the menu,
+and the buttons pressed reach the game only once let go. Aspect ratio and FPS are kept in isaac.ini (main.cpp's
+saveIniValue, shared now). It replaces Menu pressed twice to quit. Test hooks: the test script's "menushot" and
+"aspect", ISAAC_FUNKEY_MENU_RES.
+---
+ rt/audio.cpp  |   2 +
+ rt/funkey.cpp | 317 ++++++++++++++++++++++++++++++++++++++++++++++----
+ rt/main.cpp   |   2 +-
+ 3 files changed, 298 insertions(+), 23 deletions(-)
+
+diff --git a/rt/audio.cpp b/rt/audio.cpp
+index cdf85e2..60ad60e 100644
+--- a/rt/audio.cpp
++++ b/rt/audio.cpp
+@@ -95,6 +95,8 @@ static int g_genCounter = 0;
+ static std::recursive_mutex g_devMu;   // g_dev can be reopened by the main thread (output device changes)
+ void audioLock() { g_devMu.lock(); }
+ void audioUnlock() { g_devMu.unlock(); }
++// the output stopped and started again where it was (FunKey: while its menu is open, the music doesn't run on)
++void audioSetPaused(bool paused) { std::lock_guard<std::recursive_mutex> lk(g_devMu); if (g_dev) SDL_PauseAudioDevice(g_dev, paused ? 1 : 0); }
+ 
+ // (channel locked)
+ static bool chanSeek(Chan& c, uint64_t frame) {
+diff --git a/rt/funkey.cpp b/rt/funkey.cpp
+index 040b838..c8b05e8 100644
+--- a/rt/funkey.cpp
++++ b/rt/funkey.cpp
+@@ -10,7 +10,8 @@
+ //   FBIOPAN_DISPLAY after each picture hands it over so the driver sends new pictures only (it returns an error
+ //   anyway); a picture is handed over again every 0.1 s when none is new. The text console is switched to graphics
+ //   with its keyboard off while the game runs.
+-// - Buttons: the button daemon's virtual keyboard (the /dev/input device with KEY_A and KEY_Q).
++// - Buttons: the button daemon's virtual keyboard (the /dev/input device with KEY_A and KEY_Q). Menu opens the FunKey
++//   menu (volume, brightness, aspect ratio, pictures a second, exit game), in the style of FunKey-OS's emulators'.
+ // - Power-off: FunKey-OS's `powerdown schedule 0.1` sends SIGUSR1 to the PID the launcher recorded and powers off 0.1 s
+ //   later. A thread of its own takes the signal at once (the loop may be inside a room build): it ends the scheduled
+ //   power-off, starts `powerdown handle` and shows "Shutting down..."; the loop stops, main.cpp writes the save, and
+@@ -20,7 +21,7 @@
+ // The console's facts and timings come from my other FunKey S projects; this file is written for this game.
+ //
+ // Testing: ISAAC_FUNKEY_SCRIPT=<file> plays a headless test script (tools: "<tick> down|up <code>", "click x y",
+-// "eval ...", "shot file", "quit") instead of the buttons, with the game's random numbers fixed; ISAAC_TICKMARKS=1
++// "eval ...", "shot file", "quit"; and "menushot <item> <file> [1]", "aspect stretched|4:3") instead of the buttons, with the game's random numbers fixed; ISAAC_TICKMARKS=1
+ // writes "OFKMEM" lines per tick and per picture (scripts/measure/tick-cost.py); ISAAC_FUNKEY_NO_POWEROFF=1 never
+ // runs powerdown (a SIGUSR1 then only saves and quits).
+ #ifdef ISAAC_FUNKEY
+@@ -30,6 +31,7 @@
+ #include "menuui.h"
+ #include "mods.h"
+ #include "core.h"
++#include "plutovg.h"
+ #include <fcntl.h>
+ #include <linux/fb.h>
+ #include <linux/input.h>
+@@ -38,6 +40,7 @@
+ #include <pthread.h>
+ #include <signal.h>
+ #include <spawn.h>
++#include <sys/wait.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <termios.h>
+@@ -62,6 +65,7 @@
+ #include <vector>
+ 
+ extern char** environ;
++void saveIniValue(const std::string& path, const std::string& key, const std::string& val);   // (main.cpp)
+ 
+ namespace fl {
+ void runIntervals(); void recompPatchesTick(); bool recompInGameplay(bool* inGame);
+@@ -69,6 +73,8 @@ void debugEval(const std::string&);
+ extern uint32_t g_shapeTick; void rasterTrim(size_t budget);
+ const uint32_t* renderSoftOutput(int* w, int* h);
+ void leanStats(size_t* shapeBytes, size_t* soundBytes); void renderMemStats(size_t* pages, size_t* bitmaps);
++extern bool g_softStretch;           // (render_soft.cpp) the picture across the whole screen
++void audioSetPaused(bool paused);    // (audio.cpp)
+ 
+ namespace {
+ double now() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
+@@ -312,6 +318,262 @@ void crashHandler(int sig, siginfo_t* info, void* ctx) {
+     raise(sig);   // (SA_RESETHAND: the default action now, so the launcher sees the signal in the exit status)
+ }
+ 
++// ---------------------------------------------------------------- settings kept in isaac.ini (FunKey/isaac)
++std::string iniPath() {
++    const char* h = getenv("ISAAC_HOME"); std::string b = h && *h ? h : ".";
++    if (b.back() != '/') b += '/';
++    return b + "isaac.ini";
++}
++std::string iniGet(const std::string& key) {   // ("" when absent)
++    std::ifstream f(iniPath()); std::string line;
++    auto trim = [](const std::string& s) { size_t a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r"); return a == std::string::npos ? std::string() : s.substr(a, b - a + 1); };
++    while (std::getline(f, line)) {
++        std::string t = trim(line); size_t eq = t.find('=');
++        if (t.empty() || t[0] == ';' || eq == std::string::npos) continue;
++        if (trim(t.substr(0, eq)) == key) return trim(t.substr(eq + 1));
++    }
++    return "";
++}
++
++// ---------------------------------------------------------------- FunKey-OS's commands: volume, brightness, amplifier
++int fkGet(const char* tool) {   // `volume get`, `brightness get`: a percentage (-1: none, e.g. on a PC)
++    std::string path = std::string("/usr/local/sbin/") + tool;
++    if (access(path.c_str(), X_OK) != 0) return -1;
++    FILE* p = popen((path + " get 2> /dev/null").c_str(), "r");
++    if (!p) return -1;
++    int v = -1; if (fscanf(p, "%d", &v) != 1) v = -1;
++    pclose(p);
++    return v;
++}
++pid_t fkSpawn(const char* tool, const char* a1, const char* a2) {   // (0: not started)
++    std::string path = std::string("/usr/local/sbin/") + tool;
++    if (access(path.c_str(), X_OK) != 0) return 0;
++    const char* argv[] = {path.c_str(), a1, a2, nullptr};
++    pid_t pid = 0;
++    return posix_spawn(&pid, path.c_str(), nullptr, nullptr, (char* const*)argv, environ) == 0 ? pid : 0;
++}
++void fkRun(const char* tool, const char* a1, const char* a2 = nullptr) { pid_t p = fkSpawn(tool, a1, a2); if (p > 0) waitpid(p, nullptr, 0); }
++// A setting changed in the menu: `volume set N` or `brightness set N`, one at a time (they write the bootloader's
++// environment, to keep the value for the next start), the last value asked for in the end
++struct FkSetting {
++    const char* tool; pid_t pid = 0; int want = -1, sent = -1;
++    void update(bool finish = false) {
++        if (pid > 0 && waitpid(pid, nullptr, finish ? 0 : WNOHANG) != 0) pid = 0;
++        if (pid == 0 && want >= 0 && want != sent) {
++            char v[16]; snprintf(v, sizeof v, "%d", want);
++            pid = fkSpawn(tool, "set", v); sent = want;
++            if (finish && pid > 0) { waitpid(pid, nullptr, 0); pid = 0; }
++        }
++    }
++};
++
++// ---------------------------------------------------------------- the menu (the Menu button)
++// In the style of FunKey-OS's own emulators' menus, as my other FunKey S projects have it: one item at a time in a light
++// grey 180x140 box with rounded corners in the middle of the screen, the game behind darkened by black at 100/255,
++// arrows above and below, dark grey text in FunKey-OS's Open Sans Bold (/usr/games/menu_resources), 22 for the item
++// and 16 for its value, the next item sliding in 30 pixels a picture at 50 pictures a second. Up and Down choose the
++// item, Left and Right change its value (held: again after 0.5 s, then every 0.1 s), A asks "Are you sure ?" for
++// EXIT GAME and A again quits (the game's save written), B takes the question back or closes the menu, Menu closes it.
++// The game, its music and the speaker's amplifier wait meanwhile. Written for this game.
++//   VOLUME and BRIGHTNESS: FunKey-OS's own (its volume and brightness commands keep them for the next start), in
++//   steps of 10, as ten bars. ASPECT RATIO: 4:3 (black bars above and below) or STRETCHED (the whole screen). SHOW
++//   FPS: the pictures drawn a second, in the top left corner. Those two are kept in isaac.ini (funkey_aspect,
++//   funkey_fps).
++// Tests: ISAAC_FUNKEY_MENU_RES, another folder for the fonts (a PC); the test script's "menushot <item> <file> [1]".
++#include "font5x7.inc"
++enum MenuItem { MI_VOLUME, MI_BRIGHTNESS, MI_ASPECT, MI_FPS, MI_EXIT, MI_COUNT };
++const char* const kMenuTitles[MI_COUNT] = {"VOLUME", "BRIGHTNESS", "ASPECT RATIO", "SHOW FPS", "EXIT GAME"};
++constexpr int MW = 240, MH = 240, BOX_W = 180, BOX_H = 140, LINE = 18;
++constexpr uint32_t kTextRgb = 0x555555u, kBoxRgb = 0xecececu;
++constexpr uint32_t kDim = 155;   // what is left of the game behind (black at 100/255 over it)
++struct MenuState {
++    plutovg_font_face_t* bold = nullptr; bool fontsTried = false;
++    std::vector<uint32_t> dim, out;
++    int item = MI_VOLUME, volume = -1, brightness = -1; bool confirm = false, fps = false;
++    FkSetting vol{"volume"}, bri{"brightness"};
++} g_menu;
++
++void menuFonts() {
++    if (g_menu.fontsTried) return;
++    g_menu.fontsTried = true;
++    const char* dir = getenv("ISAAC_FUNKEY_MENU_RES");
++    std::string d = dir && *dir ? dir : "/usr/games/menu_resources";
++    g_menu.bold = plutovg_font_face_load_from_file((d + "/OpenSans-Bold.ttf").c_str(), 0);
++    logf("[funkey] menu font: %s\n", g_menu.bold ? "Open Sans Bold" : "not found: the built-in one");
++}
++void setRgb(plutovg_canvas_t* cv, uint32_t rgb) { plutovg_canvas_set_rgb(cv, ((rgb >> 16) & 255) / 255.f, ((rgb >> 8) & 255) / 255.f, (rgb & 255) / 255.f); }
++// text across the middle of the screen, its middle `y` pixels down: Open Sans Bold at `size`, or the 5x7 dots
++void menuText(plutovg_canvas_t* cv, const char* s, float size, float y) {
++    if (g_menu.bold) {
++        plutovg_rect_t ext; float ascent = 0, descent = 0, gap = 0; plutovg_rect_t box;
++        float adv = plutovg_font_face_text_extents(g_menu.bold, size, s, -1, PLUTOVG_TEXT_ENCODING_UTF8, &ext);
++        plutovg_font_face_get_metrics(g_menu.bold, size, &ascent, &descent, &gap, &box);
++        plutovg_canvas_set_font(cv, g_menu.bold, size);
++        setRgb(cv, kTextRgb);
++        // (capitals: their middle at y; Open Sans's capitals are 0.714 of the em high)
++        plutovg_canvas_fill_text(cv, s, -1, PLUTOVG_TEXT_ENCODING_UTF8, std::floor((MW - adv) / 2), std::round(y + 0.714f * size / 2));
++        return;
++    }
++    int k = size > 18 ? 3 : 2, n = (int)strlen(s), x0 = (MW - n * 6 * k) / 2, y0 = (int)std::lround(y) - 7 * k / 2;
++    for (int i = 0; i < n; i++) {
++        const Glyph* g = nullptr; char c = (char)toupper((unsigned char)s[i]);
++        for (auto& f : kFont) if (f.c == c) g = &f;
++        if (!g) continue;
++        for (int r = 0; r < 7; r++) for (int q = 0; q < 5; q++) if (g->r[r][q] == '#')
++            for (int yy = 0; yy < k; yy++) for (int xx = 0; xx < k; xx++) {
++                int px = x0 + (i * 6 + q) * k + xx, py = y0 + r * k + yy;
++                if (px >= 0 && px < MW && py >= 0 && py < MH) g_menu.out[(size_t)py * MW + px] = 0xff000000u | kTextRgb;
++            }
++    }
++}
++void menuRect(plutovg_canvas_t* cv, float x, float y, float w, float h, uint32_t rgb) { plutovg_canvas_rect(cv, x, y, w, h); setRgb(cv, rgb); plutovg_canvas_fill(cv); }
++// ten bars across 100x20 pixels, as many filled as tenths of the percentage
++void menuBars(plutovg_canvas_t* cv, float y, int percent) {
++    const int bw = 8, gap = 2, n = 10;
++    float x0 = (MW - (n * bw + (n - 1) * gap)) / 2.f, y0 = std::round(y - 10);
++    int full = percent < 0 ? 0 : (percent + 5) / 10;
++    for (int i = 0; i < n; i++) {
++        float x = x0 + i * (bw + gap);
++        menuRect(cv, x, y0, bw, 20, kTextRgb);
++        if (i >= full) menuRect(cv, x + 1, y0 + 1, bw - 2, 18, kBoxRgb);
++    }
++}
++void menuArrows(plutovg_canvas_t* cv) {   // 20x13, halfway between the box and the screen's edges
++    float x0 = (MW - 20) / 2.f, top = (MH - BOX_H) / 4.f - 6, bottom = MH - (MH - BOX_H) / 4.f - 7;
++    plutovg_canvas_move_to(cv, x0, top + 13); plutovg_canvas_line_to(cv, x0 + 20, top + 13); plutovg_canvas_line_to(cv, x0 + 10, top); plutovg_canvas_close_path(cv);
++    plutovg_canvas_move_to(cv, x0, bottom); plutovg_canvas_line_to(cv, x0 + 20, bottom); plutovg_canvas_line_to(cv, x0 + 10, bottom + 13); plutovg_canvas_close_path(cv);
++    setRgb(cv, kBoxRgb); plutovg_canvas_fill(cv);
++}
++// an item in its box, dy pixels below its place
++void menuItem(plutovg_canvas_t* cv, int item, float dy) {
++    plutovg_canvas_round_rect(cv, (MW - BOX_W) / 2.f, (MH - BOX_H) / 2.f + dy, BOX_W, BOX_H, 5, 5);
++    setRgb(cv, kBoxRgb); plutovg_canvas_fill(cv);
++    float mid = MH / 2.f + dy;
++    char line[64];
++    switch (item) {
++        case MI_VOLUME: case MI_BRIGHTNESS:
++            menuText(cv, kMenuTitles[item], 22, mid - LINE);
++            menuBars(cv, mid + LINE, item == MI_VOLUME ? g_menu.volume : g_menu.brightness);
++            break;
++        case MI_ASPECT: case MI_FPS:
++            menuText(cv, kMenuTitles[item], 22, mid - LINE);
++            snprintf(line, sizeof line, "<   %s   >", item == MI_ASPECT ? (g_softStretch ? "STRETCHED" : "4:3") : (g_menu.fps ? "ON" : "OFF"));
++            menuText(cv, line, 16, mid + LINE);
++            break;
++        default:
++            menuText(cv, kMenuTitles[item], 22, mid);
++            if (g_menu.confirm) menuText(cv, "Are you sure ?", 16, mid + 2 * LINE);
++            break;
++    }
++}
++// the menu's picture: the darkened game, the item (or two, sliding: `slide` pixels done, dir +1 = the next one coming
++// up from below)
++void menuDraw(int prev, int slide, int dir) {
++    g_menu.out = g_menu.dim;
++    plutovg_surface_t* s = plutovg_surface_create_for_data((unsigned char*)g_menu.out.data(), MW, MH, MW * 4);
++    plutovg_canvas_t* cv = plutovg_canvas_create(s);
++    if (slide <= 0) { menuItem(cv, g_menu.item, 0); menuArrows(cv); }
++    else { menuItem(cv, prev, (float)(-dir * slide)); menuItem(cv, g_menu.item, (float)(dir * (MH - slide))); }
++    plutovg_canvas_destroy(cv); plutovg_surface_destroy(s);
++}
++void menuBackground() {   // the picture last drawn, darkened
++    int ow = 0, oh = 0; const uint32_t* last = renderSoftOutput(&ow, &oh);
++    g_menu.dim.assign((size_t)MW * MH, 0xff000000u);
++    if (!last || ow != MW || oh != MH) return;
++    for (size_t i = 0; i < g_menu.dim.size(); i++) {
++        uint32_t c = last[i];
++        g_menu.dim[i] = 0xff000000u | ((((c & 0x00ff00ffu) * kDim) >> 8) & 0x00ff00ffu) | ((((c & 0x0000ff00u) * kDim) >> 8) & 0x0000ff00u);
++    }
++}
++// (tests) the menu on one item over the last picture, into a PPM
++void menuShot(int item, bool confirm, const char* path) {
++    menuFonts(); menuBackground();
++    int keep = g_menu.item; bool keepC = g_menu.confirm;
++    g_menu.item = std::max(0, std::min(MI_COUNT - 1, item)); g_menu.confirm = confirm;
++    if (g_menu.volume < 0) g_menu.volume = 70;
++    if (g_menu.brightness < 0) g_menu.brightness = 50;
++    menuDraw(0, 0, 0);
++    if (FILE* f = fopen(path, "wb")) {
++        fprintf(f, "P6\n%d %d\n255\n", MW, MH);
++        for (uint32_t c : g_menu.out) { uint8_t px[3] = {(uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c}; fwrite(px, 1, 3, f); }
++        fclose(f);
++    }
++    g_menu.item = keep; g_menu.confirm = keepC;
++}
++// the menu until it closes; true: EXIT GAME chosen. outW/outH: the frame's size (the picture drawn again for the
++// aspect ratio)
++bool menuRun(int outW, int outH) {
++    menuFonts();
++    g_menu.confirm = false;
++    g_menu.volume = fkGet("volume"); g_menu.brightness = fkGet("brightness");
++    g_menu.vol.want = g_menu.vol.sent = g_menu.volume; g_menu.bri.want = g_menu.bri.sent = g_menu.brightness;
++    menuBackground();
++    audioSetPaused(true); fkRun("audio_amp", "off");
++    logf("[funkey] menu: open\n");
++    bool exitGame = false, open = true, dirty = true, isDown[B_COUNT] = {};
++    int held = -1, prev = g_menu.item, slide = 0, dir = 0; double repeatAt = 0;
++    auto move = [&](int d) { prev = g_menu.item; g_menu.item = (g_menu.item + d + MI_COUNT) % MI_COUNT; dir = d; slide = 30; g_menu.confirm = false; };
++    auto change = [&](int d) {
++        switch (g_menu.item) {
++            case MI_VOLUME: if (g_menu.volume >= 0) g_menu.vol.want = g_menu.volume = std::max(0, std::min(100, g_menu.volume + 10 * d)); break;
++            case MI_BRIGHTNESS: if (g_menu.brightness >= 0) g_menu.bri.want = g_menu.brightness = std::max(10, std::min(100, g_menu.brightness + 10 * d)); break;
++            case MI_ASPECT:
++                g_softStretch = !g_softStretch;
++                saveIniValue(iniPath(), "funkey_aspect", g_softStretch ? "stretched" : "4:3");
++                renderFrame(outW, outH, 1.0); renderEndFrame(); menuBackground();   // (the game behind, in its new shape)
++                break;
++            case MI_FPS: g_menu.fps = !g_menu.fps; saveIniValue(iniPath(), "funkey_fps", g_menu.fps ? "1" : "0"); break;
++            default: break;
++        }
++        dirty = true;
++    };
++    while (open && !g_stopReq && !g_powerReq) {
++        inputPoll([&](int b, bool d) {
++            isDown[b] = d;
++            if (!d) { if (b == held) held = -1; return; }
++            switch (b) {
++                case B_UP: case B_DOWN: if (!g_menu.confirm && slide == 0) { move(b == B_DOWN ? 1 : -1); held = b; repeatAt = now() + 0.5; } break;
++                case B_LEFT: case B_RIGHT: if (!g_menu.confirm) { change(b == B_RIGHT ? 1 : -1); held = b; repeatAt = now() + 0.5; } break;
++                case B_A:
++                    if (g_menu.item == MI_EXIT) { if (g_menu.confirm) { exitGame = true; open = false; } else { g_menu.confirm = true; dirty = true; } }
++                    else if (g_menu.item == MI_ASPECT || g_menu.item == MI_FPS) change(1);
++                    break;
++                case B_B: if (g_menu.confirm) { g_menu.confirm = false; dirty = true; } else open = false; break;
++                case B_MENU: open = false; break;
++                default: break;
++            }
++        });
++        if (!open) break;
++        double t = now();
++        if (held >= 0 && slide == 0 && t >= repeatAt) {
++            if (held == B_UP || held == B_DOWN) move(held == B_DOWN ? 1 : -1); else change(held == B_RIGHT ? 1 : -1);
++            repeatAt = t + 0.1;
++        }
++        g_menu.vol.update(); g_menu.bri.update();
++        if (dirty || slide > 0) {
++            menuDraw(prev, slide, dir);
++            fbPresent(g_menu.out.data(), MW, MH);
++            dirty = false;
++            if (slide > 0 && (slide += 30) >= MH) { slide = 0; dirty = true; }
++            inputWait(0.02);   // (50 pictures a second while sliding)
++        } else {
++            fbKeepShown();
++            inputWait(0.05);
++        }
++    }
++    // back to the game once the buttons are let go (1 s at most): none of them reaches it
++    for (double until = now() + 1.0; now() < until && !g_stopReq && !g_powerReq;) {
++        bool any = false; for (bool d : isDown) any |= d;
++        if (!any) break;
++        inputPoll([&](int b, bool d) { isDown[b] = d; });
++        inputWait(0.02);
++    }
++    g_menu.vol.update(true); g_menu.bri.update(true);
++    fkRun("audio_amp", "on"); audioSetPaused(false);
++    logf("[funkey] menu: %s\n", exitGame ? "EXIT GAME" : "closed");
++    return exitGame;
++}
++
+ // ---------------------------------------------------------------- memory, for the log
+ void memInfo(int& rssKB, int& swapKB, int& availKB) {
+     rssKB = swapKB = availKB = -1;
+@@ -376,16 +638,13 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+     bool down[B_COUNT] = {};
+     bool fnAlone = false; double fnAt = 0; int pulseKey = 0; uint32_t pulseUntil = 0;
+     int navDir = -1; double navNext = 0;
+-    double menuAt = -10; bool quit = false;
++    bool quit = false, menuReq = false;
++    // the menu's settings (isaac.ini): the picture's shape, the pictures a second shown
++    { std::string a = iniGet("funkey_aspect"); if (a == "stretched") g_softStretch = true; else if (a == "4:3") g_softStretch = false; }
++    g_menu.fps = perfOverlay || iniGet("funkey_fps") == "1";
+     auto onButton = [&](int b, bool isDown) {
+         down[b] = isDown;
+-        if (b == B_MENU) {
+-            if (!isDown) return;
+-            double t = now();
+-            if (t - menuAt < 2.5) { quit = true; return; }
+-            menuAt = t; notify("Press MENU again^to quit");
+-            return;
+-        }
++        if (b == B_MENU) { if (isDown) menuReq = true; return; }   // the menu (menuRun), between two ticks
+         if (b == B_FN) {   // a card or pill when let go, if no other button was pressed meanwhile
+             if (isDown) { fnAlone = true; fnAt = now(); return; }
+             if (!fnAlone || now() - fnAt > 0.6) return;
+@@ -415,6 +674,7 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+     struct Win { int ticks = 0, frames = 0, skipped = 0, stalls = 0; double logic = 0, draw = 0, present = 0, gc = 0, worst = 0; } w;
+     double winStart = now();
+     std::vector<std::string> perfLines;
++    double fpsStart = now(); int fpsFrames = 0;   // (SHOW FPS: the pictures of the last second)
+     if (screen) notify("");
+     while (!quit && !g_stopReq && !g_powerReq && !g_player.quit) {
+         // buttons (or the script)
+@@ -426,9 +686,14 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+                 else if (c.op == "click") { double x = 0, y = 0; sscanf(c.arg.c_str(), "%lf %lf", &x, &y); mouseEvent(x, y, 0); mouseEvent(x, y, 1); mouseEvent(x, y, 2); }
+                 else if (c.op == "eval") debugEval(c.arg);
+                 else if (c.op == "shot") renderScreenshot(c.arg.c_str());   // (the last picture shown)
++                else if (c.op == "menushot") {   // the menu on an item over the last picture: "menushot <item> <file> [1: the question]"
++                    int it = 0, conf = 0; char path[256] = {0};
++                    if (sscanf(c.arg.c_str(), "%d %255s %d", &it, path, &conf) >= 2) menuShot(it, conf != 0, path);
++                }
++                else if (c.op == "aspect") g_softStretch = c.arg == "stretched";   // (tests: the picture's shape)
+                 else if (c.op == "quit") quit = true;
+             }
+-            inputPoll([&](int b, bool d) { if (b == B_MENU) onButton(b, d); });   // (Menu still quits)
++            inputPoll([&](int b, bool d) { if (b == B_MENU) onButton(b, d); });   // (Menu still opens the menu)
+         } else {
+             inputPoll(onButton);
+             bool ig = false, play = recompInGameplay(&ig);
+@@ -441,7 +706,17 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+             if (pulseKey && g_player.tick >= pulseUntil) { keyUp(pulseKey); pulseKey = 0; }
+         }
+         if (quit) break;
+-        if (menuAt > 0 && now() - menuAt >= 2.5) { menuAt = -10; notify(""); }
++        if (menuReq) {   // the menu: the game's keys let go first, its clock stopped meanwhile
++            menuReq = false;
++            for (int b = 0; b < B_COUNT; b++) { if (held[b]) keyUp(held[b]); held[b] = 0; down[b] = false; }
++            if (pulseKey) { keyUp(pulseKey); pulseKey = 0; }
++            fnAlone = false; navDir = -1;
++            double m0 = now();
++            if (menuRun(outW, outH)) quit = true;
++            double away = now() - m0;
++            clockStart += away; next += away; winStart += away; fpsStart += away;
++            if (quit) break;
++        }
+ 
+         // one logic tick
+         g_player.timeMs = scripted ? g_player.tick * 1000.0 / g_frameRate : (now() - clockStart) * 1000.0;
+@@ -463,14 +738,14 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+             SnapPtr snap = buildSnapshot(); menuUiFill(*snap);
+             renderAdopt(snap);
+             renderFrame(outW, outH, 1.0);
+-            if (perfOverlay) renderOverlay(perfLines);
++            if (g_menu.fps) renderOverlay(perfLines);
+             renderEndFrame();
+             double d1 = now();
+             int ow, oh; const uint32_t* out = renderSoftOutput(&ow, &oh);
+             fbPresent(out, ow, oh);
+             double d2 = now();
+             if (marks) logf("OFKMEM draw %u ms %.3f cpu %.3f rasters %d quads %d present %.3f\n", g_player.tick, (d2 - d0) * 1000, threadCpuMs() - dc0, g_rstats.rasters, g_rstats.quads, (d2 - d1) * 1000);
+-            w.draw += (d1 - d0) * 1000; w.present += (d2 - d1) * 1000; w.frames++; drawn++;
++            w.draw += (d1 - d0) * 1000; w.present += (d2 - d1) * 1000; w.frames++; drawn++; fpsFrames++;
+             skipped = 0;
+         } else { skipped++; w.skipped++; fbKeepShown(); }
+ 
+@@ -495,24 +770,22 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+         if (t < next) inputWait(next - t);
+         else if (t > next + 0.5) { next = t; w.stalls++; }
+ 
++        if (t - fpsStart >= 1) {   // SHOW FPS (the menu): the pictures drawn in the last second
++            char a[32]; snprintf(a, sizeof a, "%.0f FPS", fpsFrames / (t - fpsStart));
++            perfLines = {a};
++            fpsFrames = 0; fpsStart = t;
++        }
+         if (t - winStart >= 5) {
+             int rss, swap, avail; memInfo(rss, swap, avail);
+             double secs = t - winStart; int n = std::max(1, w.ticks), nf = std::max(1, w.frames);
+             logf("[funkey] %.1f s: %.1f ticks/s, %.1f pictures/s (%d skipped), stalls %d | per tick: logic %.1f ms, gc %.1f; per picture: draw %.1f, present %.1f; worst tick %.0f ms | rss %d MB, swap %d MB, available %d MB\n",
+                  secs, w.ticks / secs, w.frames / secs, w.skipped, w.stalls, w.logic / n, w.gc / n, w.draw / nf, w.present / nf, w.worst, rss >> 10, swap >> 10, avail >> 10);
+-            if (perfOverlay) {
+-                char a[64], b[64], c[64];
+-                snprintf(a, sizeof a, "%.0f TPS %.0f FPS", w.ticks / secs, w.frames / secs);
+-                snprintf(b, sizeof b, "LOGIC %.1f DRAW %.1f GC %.1f", w.logic / n, w.draw / nf, w.gc / n);
+-                snprintf(c, sizeof c, "RSS %d MB SWAP %d", rss >> 10, swap >> 10);
+-                perfLines = {a, b, c};
+-            }
+             w = Win(); winStart = t;
+         }
+     }
+     if (g_powerReq) logf("[funkey] stopping for the power-off\n");
+     else if (g_stopReq) logf("[funkey] stopping: asked to\n");
+-    else logf("[funkey] quitting (Menu twice, or the game)\n");
++    else logf("[funkey] quitting (EXIT GAME in the menu, or the game)\n");
+     if (screen) { if (!g_powerReq) notify(""); memset(g_fb.mem, 0, g_fb.size); fbPan(); }
+     restoreConsole();
+     return drawn;
+diff --git a/rt/main.cpp b/rt/main.cpp
+index 8431e97..ff01d66 100644
+--- a/rt/main.cpp
++++ b/rt/main.cpp
+@@ -203,7 +203,7 @@ static void loadConfig(const std::string& path, Config& c) {
+     if (c.cacheMB < 32) c.cacheMB = 32;
+ }
+ // changes (or adds) "key = value" in isaac.ini, preserving the rest of the file
+-static void saveIniValue(const std::string& path, const std::string& key, const std::string& val) {
++void saveIniValue(const std::string& path, const std::string& key, const std::string& val) {   // (funkey.cpp too)
+     std::ifstream f(path); std::vector<std::string> lines; std::string line; bool found = false;
+     while (std::getline(f, line)) {
+         std::string t = trim(line);

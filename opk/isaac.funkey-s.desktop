@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=The Binding of Isaac
+Comment=IsaacRecomp: the Flash game, recompiled (needs your Steam Isaac.exe in FunKey/isaac)
+Icon=isaac
+Exec=isaac.sh
+Terminal=false
+X-OD-NeedsDownscaling=false
+Categories=games;
+

@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Fri, 30 Oct 2026 17:41:40 -0400
+Subject: [PATCH] FunKey S build option, and headless measurements of the logic
+
+ISAAC_FUNKEY (CMake) builds upstream's Linux program for the FunKey S (one Cortex-A7 core, 64 MB of RAM, no GPU):
+the PSP's lean SWF loading (FL_LEAN) and 363x272 stage (genpsp/), the PSP's memory limits and budgets (parsed shapes
+5 MB with eviction, short sounds 2 MB, decoded SWF bitmaps trimmed to 1.5 MB after every tick), no helper threads
+(platformPoolWorkers / platformRasterServiceWorkers 0, as on the PSP), 24 sound channels, the PSP's leaf-cache rules,
+no OpenGL, SDL2 and zlib linked statically (the FunKey's sysroot has SDL2 as a static library only; firmwares differ
+in the libraries they ship).
+
+musl has no backtrace(): the stack sampling (ISAAC_SAMPLE_TICK) and ISAAC_RNGTRACE's call sites are glibc only.
+
+For measuring the logic on a one-core device, headless mode gains:
+- ISAAC_SNAPSHOT=1 (with --norender): the snapshot a renderer would get is built every tick and dropped, since on
+  one core it is made on the logic's time;
+- ISAAC_TICKMARKS=1: "OFKMEM begin N" before and "OFKMEM tick N ents E ms T cpu C objs O" after the timed part of
+  every tick (wall-clock and thread CPU time, enemies, GC objects); qemu's armprof plugin records the instruction
+  count at each such line, so the instructions between the two are exactly what the timing covers;
+- g_shapeTick follows the logic tick (shape eviction keeps what was used in the last 2 s);
+- the run's peak and final memory (VmHWM, VmRSS, RssAnon, RssFile) at the end, on Linux;
+- ISAAC_GCMINLIVE / ISAAC_GCGROWTH override the collector's thresholds.
+
+Checked: the FunKey build plays the same as the lean PC build built with the same maths functions (musl 1.2.1's),
+every enemy's state at every tick of 12,580 (tboi-funkeys scripts/measure/same-game.sh). On the console at 1296 MHz
+the logic takes 9.9 ms per tick on average, 12.8 ms at the 90th percentile; peak memory 37.8 MB.
+---
+ CMakeLists.txt  | 25 +++++++++++++++++++++++--
+ rt/audio.cpp    |  2 +-
+ rt/core.cpp     |  4 ++--
+ rt/main.cpp     | 48 +++++++++++++++++++++++++++++++++++++++++++++---
+ rt/platform.cpp | 12 ++++++++----
+ rt/raster.cpp   |  4 ++--
+ 6 files changed, 81 insertions(+), 14 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2271f28..1731fb7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -8,6 +8,13 @@ add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-ffp-contract=off> $<
+ if(NOT CMAKE_BUILD_TYPE)
+   set(CMAKE_BUILD_TYPE Release)
+ endif()
++# FunKey S (one Cortex-A7 core, 64 MB of RAM, no GPU, a 240x240 screen; built with the tboi-funkeys toolchain): the
++# PSP's lean loading and 363x272 stage (genpsp/), one thread for the game, the PSP's memory limits, SDL2 (static,
++# for sound and timers only) and no OpenGL
++option(ISAAC_FUNKEY "FunKey S build (lean loading, PSP stage, one thread)" OFF)
++if(ISAAC_FUNKEY)
++  set(NO_SYSTEM_GL ON)
++endif()
+ 
+ if(NINTENDO_SWITCH)
+   set(SDL2_INCLUDE_DIRS ${PORTLIBS}/include/SDL2)
+@@ -119,7 +126,7 @@ if(PSP)
+ endif()
+ 
+ # recompiled AVM1 code: gen/ (1440x1080 stage, PC) or gen720/ (960x720, Switch and Android: lighter on the CPU)
+-if(PSP)
++if(PSP OR ISAAC_FUNKEY)
+   set(ISAAC_GEN_DIR genpsp CACHE STRING "")   # 363x272 stage (_root at 56.7 %): the PSP screen's height
+ elseif(NINTENDO_SWITCH OR ANDROID)
+   set(ISAAC_GEN_DIR gen720 CACHE STRING "")
+@@ -154,6 +161,9 @@ endif()
+ # lean SWF loading (PSP; on PC for testing): the SWF is decompressed to a cache file, sounds read from it on demand,
+ # shapes parsed when first drawn
+ option(ISAAC_LEAN "Lean SWF loading (PSP memory budget)" OFF)
++if(ISAAC_FUNKEY)
++  set(ISAAC_LEAN ON CACHE BOOL "" FORCE)
++endif()
+ if(ANDROID)
+   add_library(isaac SHARED ${RT_SRC})
+   set_target_properties(isaac PROPERTIES OUTPUT_NAME main)   # libmain.so: the name SDL's activity loads
+@@ -191,7 +201,16 @@ if(NOT PSP)
+   target_link_libraries(isaac PRIVATE isaacgen plutovg)
+   if(ISAAC_LEAN)
+     target_compile_definitions(isaac PRIVATE FL_LEAN)
+-    target_link_libraries(isaac PRIVATE z)
++    if(ISAAC_FUNKEY)
++      find_package(ZLIB REQUIRED)   # (the static library: the FunKey toolchain only finds .a files)
++      target_link_libraries(isaac PRIVATE ZLIB::ZLIB)
++    else()
++      target_link_libraries(isaac PRIVATE z)
++    endif()
++  endif()
++  if(ISAAC_FUNKEY)
++    target_compile_definitions(isaac PRIVATE ISAAC_FUNKEY)
++    target_compile_options(isaac PRIVATE -Wno-psabi)   # (GCC's note that an ABI changed in GCC 7.1, on every call)
+   endif()
+ endif()
+ # on Windows it can't be named isaac.exe: Steam's Isaac.exe (with the game data) usually sits in the same folder
+@@ -222,6 +241,8 @@ elseif(NINTENDO_SWITCH)
+     COMMAND ${DEVKITPRO}/tools/bin/nacptool --create "${APP_TITLE}" "${APP_AUTHOR}" "${APP_VERSION}" isaac.nacp
+     COMMAND ${DEVKITPRO}/tools/bin/elf2nro $<TARGET_FILE:isaac> isaac.nro --icon=${CMAKE_SOURCE_DIR}/switch/icon.jpg --nacp=isaac.nacp
+     COMMENT "Generating isaac.nro")
++elseif(ISAAC_FUNKEY)
++  target_link_libraries(isaac PRIVATE SDL2::SDL2-static)   # (the FunKey sysroot has SDL2 as a static library only)
+ elseif(TARGET SDL2::SDL2)
+   if(TARGET SDL2::SDL2main)
+     target_link_libraries(isaac PRIVATE SDL2::SDL2main)
+diff --git a/rt/audio.cpp b/rt/audio.cpp
+index 9e5923c..91c8c2f 100644
+--- a/rt/audio.cpp
++++ b/rt/audio.cpp
+@@ -82,7 +82,7 @@ static void pcmStore(const SoundDef* s, std::shared_ptr<PcmClip> c) {
+         g_pcmBytes -= old->second->s.size() * 2; g_pcmCache.erase(old);
+     }
+ }
+-#ifdef __PSP__
++#if defined(__PSP__) || defined(ISAAC_FUNKEY)
+ static const int kChans = 24;   // (memory: about 33 KB each)
+ #else
+ static const int kChans = 48;
+diff --git a/rt/core.cpp b/rt/core.cpp
+index 7c56c6e..6db1f67 100644
+--- a/rt/core.cpp
++++ b/rt/core.cpp
+@@ -7,7 +7,7 @@
+ #include <algorithm>
+ #include <functional>
+ #include <chrono>
+-#if defined(__linux__) && !defined(__ANDROID__)   // (Android: no backtrace() before API 33)
++#if defined(__linux__) && !defined(__ANDROID__) && defined(__GLIBC__)   // (Android: no backtrace() before API 33; musl: none)
+ #include <execinfo.h>
+ #include <dlfcn.h>
+ #endif
+@@ -519,7 +519,7 @@ uint64_t g_rngCalls = 0;
+ static void rngTrace(const char* what) {   // (testing) ISAAC_RNGTRACE: who asks for random numbers (addresses for addr2line)
+     static int on = -1; if (on < 0) on = getenv("ISAAC_RNGTRACE") != nullptr;
+     if (!on) return;
+-#if defined(__linux__) && !defined(__ANDROID__)
++#if defined(__linux__) && !defined(__ANDROID__) && defined(__GLIBC__)
+     void* bt[8]; int n = backtrace(bt, 8);
+     fprintf(stderr, "[rngcall] %llu %s", (unsigned long long)g_rngCalls, what);
+     for (int i = 2; i < n; i++) { Dl_info di; if (dladdr(bt[i], &di) && di.dli_fbase) fprintf(stderr, " 0x%lx", (unsigned long)((char*)bt[i] - (char*)di.dli_fbase)); }
+diff --git a/rt/main.cpp b/rt/main.cpp
+index af17aa7..019006d 100644
+--- a/rt/main.cpp
++++ b/rt/main.cpp
+@@ -41,6 +41,7 @@
+ #include <deque>
+ #include <functional>
+ #include <cmath>
++#include <ctime>
+ 
+ namespace fl {
+ extern bool g_rngSeedFixed;
+@@ -69,6 +70,8 @@ bool renderPaceWait(uint64_t timeoutNs);
+ int renderAtlasPages();
+ extern float g_audioVolume;
+ extern std::atomic<float> g_moveScale; extern bool g_joyAccel;
++extern bool g_shapeEvict; extern size_t g_shapeBudgetBytes, g_soundCacheBytes; extern uint32_t g_shapeTick;
++void rasterTrim(size_t budget);
+ }
+ // joystick_acceleration: how far the stick is pushed (0..1) -> movement factor. Below the dead zone nothing moves;
+ // just past it the player moves at 40% of its speed, rising linearly to 100% at 75% of the stick's travel.
+@@ -288,8 +291,9 @@ static void javaVoid(const char* method, const char* arg = nullptr) {
+ // ---- test script (--script): "tick action arg" per line
+ struct ScriptCmd { uint32_t tick; std::string op; std::string arg; };
+ 
+-#if !defined(__SWITCH__) && !defined(_WIN32) && !defined(__ANDROID__)
+-// (diagnostics: stack sampling with SIGPROF during a specific tick, ISAAC_SAMPLE_TICK=n)
++#if !defined(__SWITCH__) && !defined(_WIN32) && !defined(__ANDROID__) && defined(__GLIBC__)
++// (diagnostics: stack sampling with SIGPROF during a specific tick, ISAAC_SAMPLE_TICK=n; glibc only: musl has no
++// backtrace())
+ #include <execinfo.h>
+ #include <signal.h>
+ #include <sys/time.h>
+@@ -320,6 +324,14 @@ static void profSampleStop() {
+ static void profSampleStart() {}
+ static void profSampleStop() {}
+ #endif
++// (testing) CPU time of the calling thread, ms (0 where there is no per-thread clock)
++static double threadCpuMs() {
++#if defined(CLOCK_THREAD_CPUTIME_ID) && !defined(_WIN32)
++    timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
++#else
++    return 0;
++#endif
++}
+ static double g_benchAlpha = 1.0;
+ // Windowed: fit the whole window (with its title bar) inside the usable screen area, without going under the
+ // taskbar, keeping the aspect ratio of the requested size, and centered.
+@@ -539,6 +551,12 @@ int main(int argc, char** argv) {
+ #endif
+ #ifdef FL_LEAN
+     fl::g_leanSwf = getenv("ISAAC_NOLEAN") == nullptr; fl::g_leanCacheDir = pref;   // (lean loading: PSP / tests)
++#endif
++#ifdef ISAAC_FUNKEY
++    // the PSP's memory budgets (main_psp.cpp): parsed shapes 5 MB, the least recently used dropped beyond it (only
++    // with one thread using them: headless mode here, and the FunKey's own main loop), short sounds kept decoded 2 MB.
++    // Decoded SWF bitmaps are trimmed to 1.5 MB after every tick (below)
++    fl::g_shapeEvict = true; fl::g_shapeBudgetBytes = 5u << 20; fl::g_soundCacheBytes = 2u << 20;
+ #endif
+     loadConfig(base + "isaac.ini", cfg);
+     {   // mods: the "mods" folder next to the program (mods.h), turned on with `mods =` in isaac.ini
+@@ -838,17 +856,34 @@ int main(int argc, char** argv) {
+                 if (k != aimKey) { if (aimKey) keyEvent(aimKey, 0, false); if (k) keyEvent(k, 0, true); aimKey = k; }
+             }
+             monkeyStep();
+-            Uint64 lt0 = SDL_GetPerformanceCounter(); size_t heap0 = gcCount();
++            // (testing) "OFKMEM begin" and "OFKMEM tick" (below) bracket exactly the part of the tick that is timed: under
++            // qemu's armprof, the instructions between them are the logic's; from "tick" to the next "begin", the rest
++            // (the script's input, and mixing 1/30 s of sound: audioDumpTick)
++            static const bool tickMarks = getenv("ISAAC_TICKMARKS") != nullptr;
++            if (tickMarks) logf("OFKMEM begin %u\n", g_player.tick);
++            Uint64 lt0 = SDL_GetPerformanceCounter(); size_t heap0 = gcCount(); double cpu0 = threadCpuMs();
+             static int sampleTick = getenv("ISAAC_SAMPLE_TICK") ? atoi(getenv("ISAAC_SAMPLE_TICK")) : -1;
+             if ((int)g_player.tick == sampleTick) profSampleStart();
++            g_shapeTick = g_player.tick;   // (shape eviction: what was used in the last 2 s stays)
+             runFrame(); runIntervals(); recompPatchesTick(); fl::modsTick();
+             static const bool menuUi = getenv("ISAAC_MENUUI") != nullptr;   // (testing the controller menus / rebinding screen)
+             if (menuUi) { bool ig = false, gp = recompInGameplay(&ig); menuUiTick(gp, ig); }
++            // (testing: one-core devices) without a renderer, the snapshot it would take is still built, and dropped:
++            // on a single core it is made on the logic's time, so it belongs in the tick's cost (as in main_psp.cpp)
++            static const bool snapAlways = norender && getenv("ISAAC_SNAPSHOT") != nullptr;
++            if (snapAlways) { SnapPtr s = buildSnapshot(); if (menuUi) menuUiFill(*s); }
+             gcCollect();
++#ifdef ISAAC_FUNKEY
++            rasterTrim(3u << 19);   // (decoded SWF bitmaps: 1.5 MB, as on the PSP)
++#endif
+             if ((int)g_player.tick == sampleTick + 1) profSampleStop();
+             double lms = (SDL_GetPerformanceCounter() - lt0) * 1000.0 / freq;
+             static const bool tickMs = getenv("ISAAC_TICKMS") != nullptr;   // (testing) logic cost of every tick
+             if (tickMs) logf("[tick] %u %.3f %d %zu\n", g_player.tick, lms, entityCount(), gcCount());
++            // (testing) the same, one "OFKMEM" line per tick: qemu's armprof plugin (tboi-funkeys) records how many
++            // instructions ran at each such line; cpu = the time the CPU spent on this thread, which other programs
++            // running at the same time don't change
++            if (tickMarks) logf("OFKMEM tick %u ents %d ms %.3f cpu %.3f objs %zu\n", g_player.tick, entityCount(), lms, threadCpuMs() - cpu0, gcCount());
+             if (stats) {
+                 int nb = entityCount();
+                 logicMs.push_back(lms); ballCount.push_back(nb); allocs.push_back((double)gcCount() - (double)heap0);
+@@ -1910,6 +1945,13 @@ int main(int argc, char** argv) {
+     }
+     if (stats) { rasterMemStats(); logf("[mem] heap objects %zu, SWF %zu MB, GC total %.1f ms\n", gcCount(), g_movie.data.size() >> 20, g_gcMs); }
+     logf("logic ticks: %u, frames drawn: %llu\n", g_player.tick, (unsigned long long)renderedFrames);
++#ifdef __linux__
++    if (headless) if (FILE* f = fopen("/proc/self/status", "r")) {   // (testing) peak and current memory of the run
++        char l[160];
++        while (fgets(l, sizeof l, f)) if (!strncmp(l, "VmHWM", 5) || !strncmp(l, "VmRSS", 5) || !strncmp(l, "RssAnon", 7) || !strncmp(l, "RssFile", 7)) logf("[mem] %s", l);
++        fclose(f);
++    }
++#endif
+     sharedObjectFlushAll();
+     if (!wavPath.empty()) { fl::audioDumpClose(); }
+     soundStopAll();
+diff --git a/rt/platform.cpp b/rt/platform.cpp
+index da0640b..323e4af 100644
+--- a/rt/platform.cpp
++++ b/rt/platform.cpp
+@@ -45,8 +45,9 @@ void platformInitLimits() {
+     g_lim = kBig;
+     g_lim.defaultCacheMB = 512;
+     g_lim.pboBytes = 32u << 20;
+-#elif defined(__PSP__)
+-    // PSP (2000 and later): ~50 MB for everything. No GPU-side layers, a few atlas pages (see render_psp.cpp)
++#elif defined(__PSP__) || defined(ISAAC_FUNKEY)
++    // PSP (2000 and later): ~50 MB for everything. No GPU-side layers, a few atlas pages (see render_psp.cpp).
++    // FunKey S: ~46 MB for everything, and no GPU either: the PSP's limits to begin with
+     g_lim = {15000, 4u << 20, 1u << 20, 2u << 20, 0, 0, 0, 6, 2.0, true, 1.4};   // (objects ~200 bytes: collect early)
+ #elif defined(FL_SWITCH_MEMORY)
+     g_lim = kSmall;
+@@ -56,6 +57,9 @@ void platformInitLimits() {
+ #if defined(FL_LEAN) && !defined(__PSP__)
+     if (getenv("ISAAC_PSPLIMITS")) g_lim = {15000, 4u << 20, 1u << 20, 1u << 20, 0, 0, 0, 6, 2.0, true, 1.4};   // (tests: the PSP's)
+ #endif
++    // (testing) the collector's thresholds: objects that trigger the first collection, growth before the next one
++    if (const char* e = getenv("ISAAC_GCMINLIVE")) g_lim.gcMinLive = strtoul(e, nullptr, 10);
++    if (const char* e = getenv("ISAAC_GCGROWTH")) g_lim.gcGrowth = atof(e);
+ }
+ 
+ #ifdef __ANDROID__
+@@ -97,7 +101,7 @@ const CpuSets& cpuSets() {
+ // This way the renderer never waits for the logic to release a core (Horizon does not time-slice between
+ // threads of the same priority: one does not progress until the other blocks).
+ int platformPoolWorkers(ThreadRole role) {
+-#if defined(__PSP__)
++#if defined(__PSP__) || defined(ISAAC_FUNKEY)
+     (void)role; return 0;   // one core: everything on the calling thread
+ #elif defined(__SWITCH__)
+     return role == ROLE_LOGIC ? 2 : 1;
+@@ -118,7 +122,7 @@ void platformPoolWorkerPlace(ThreadRole role, int i, int* core, int* prio) {
+     else { *core = 2; *prio = 0x2D; }
+ }
+ int platformRasterServiceWorkers() {
+-#if defined(__PSP__)
++#if defined(__PSP__) || defined(ISAAC_FUNKEY)
+     return 0;
+ #elif defined(__SWITCH__)
+     return 2;
+diff --git a/rt/raster.cpp b/rt/raster.cpp
+index 9b088f7..3e33d10 100644
+--- a/rt/raster.cpp
++++ b/rt/raster.cpp
+@@ -510,7 +510,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
+     for (int i = 0; i < 4; i++) { double x, y; mm.apply(xs[i], ys[i], x, y); lx = std::min(lx, x); hx = std::max(hx, x); ly = std::min(ly, y); hy = std::max(hy, y); }
+     int x0 = (int)std::floor(lx) - 2, y0 = (int)std::floor(ly) - 2, x1 = (int)std::ceil(hx) + 2, y1 = (int)std::ceil(hy) + 2;
+     p.w = x1 - x0; p.h = y1 - y0;
+-#ifdef __PSP__
++#if defined(__PSP__) || defined(ISAAC_FUNKEY)
+     if (p.w <= 0 || p.h <= 0 || p.w > 1024 || p.h > 1024) return false;   // (memory: big ones painted straight into the bitmap)
+ #else
+     if (p.w <= 0 || p.h <= 0 || p.w > 4096 || p.h > 4096) return false;
+@@ -683,7 +683,7 @@ static void evictLeaves() {
+     for (auto& kv : g_leafCache) order.push_back({kv.second->lastUse, kv.first});
+     std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+     for (auto& o : order) {
+-#ifdef __PSP__
++#if defined(__PSP__) || defined(ISAAC_FUNKEY)
+         if (g_leafBytes <= g_lim.leafBudgetBytes * 3 / 4) break;   // (memory: even the leaves of this draw, it is done)
+ #else
+         if (g_leafBytes <= g_lim.leafBudgetBytes * 3 / 4 || o.first == g_leafSeq) break;
