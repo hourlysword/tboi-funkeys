@@ -22,6 +22,14 @@ Steam (the original, *Wrath of the Lamb* or the *Eternal Edition*). Copy `Isaac.
 and this port pulls what it needs from it. This repository holds absolutely no game code either: upstream's code translated from
 the game stays in the upstream checkout, and the changes from this project are a patch series on upstream's engine (`rt/`).
 
+## Limitations/Considerations
+
+- While the game is running (and ONLY while it's running), it overclocks the CPU to 1296 MHz to keep the framerate up. Obviously you should expect slightly worse battery life than you'd get even with heavier 3D titles (running at normal clock speed) on this system due to this.
+- Every new floor pauses for about half a second when it starts.
+- In-progress runs aren't kept when you quit or power off: this is a limitation of the original game as well.
+- Blurred shadows (title screen, cutscenes) are drawn sharp, or aren't drawn at all.
+- Not yet tested on stock Funkey OS
+
 ## Install
 
 1. Copy `isaac_funkey-s.opk` and `isaac_funkey-s.png` (its picture in RetroFE) into the **Native games** folder of the
