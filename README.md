@@ -3,6 +3,10 @@
 This project is a port and adaptation of [IsaacRecomp](https://github.com/whylurking/IsaacRecomp), the
 native C++ recompilation of the Flash game, to the [FunKey S](https://www.funkey-project.com/). 
 
+![release](https://img.shields.io/github/v/release/hourlysword/tboi-funkeys)
+![platform](https://img.shields.io/badge/platform-FunKey_S-blue)
+![licence](https://img.shields.io/badge/licence-MIT-blue)
+
 ## Features
 
 - **Full game speed:** Runs at about 29 fps on average, even in the busier rooms.
