@@ -35,7 +35,7 @@ the game stays in the upstream checkout, and the changes from this project are a
 1. Copy `isaac_funkey-s.opk` and `isaac_funkey-s.png` (its picture in RetroFE) into the **Native games** folder of the
    FunKey's USB share.
 2. Create the folder `FunKey/isaac` and copy `Isaac.exe` from your Steam game into it (Steam: right-click the game,
-   Manage, Browse local files; `Isaac.exe`, not `Binding_of_Isaac.exe`). You can add different versions if you want, just rename the executables (`Isaac-Eternal.exe`...): the program asks which version you want to play when it starts, and suggest you're last played version when you boot it up again.
+   Manage, Browse local files; `Isaac.exe`, not `Binding_of_Isaac.exe`). You can add different versions if you want, just rename the executables (`Isaac-Eternal.exe`...): the program asks which version you want to play when it starts, and suggests you're last played version when you boot it up again.
 3. Start *The Binding of Isaac* from GMenu2X, or `isaac_funkey-s` in RetroFE's Native games. The very first start
    unpacks the game into `FunKey/isaac/saves` (about 15 seconds); any launches after that boot up quicker.
 
@@ -81,7 +81,7 @@ bash scripts/funkey/make-release.sh v1.0.0  # out/tboi-funkeys-v1.0.0.zip
 
 ## Contact
 
-hourlysword.dev@gmail.com: bugs, suggestions, rights-holder requests. feel free raise an issue here to submit bugs/suggestions as well!
+hourlysword.dev@gmail.com: bugs, suggestions, rights-holder requests. feel free to raise an issue here to submit bugs/suggestions as well!
 
 ## Credits
 
