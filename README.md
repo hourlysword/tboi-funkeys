@@ -14,10 +14,13 @@ native C++ recompilation of the Flash game, to the [FunKey S](https://www.funkey
   add more than one version to the folder and you'll get asked which version you'd like to play when it loads up.
 - **Sound:** music and effects are supported.
 - **Display Modes:** You can switch between 4:3 with black bars, or stretch the picture.
-- **FunKey menu** RetroFE style menu built with the following options: volume, brightness, picture mode, an FPS counter, and exit
+- **FunKey menu** RetroFE style menu built with the following options: volume, brightness, picture mode, an FPS counter, overclock on/off, and exit
   game. Game pauses while this menu is open.
 - **Achievements/Unlocks:** Unlocks and statistics are saved when you exit, and even when you power off
-  mid-game!
+  mid-game! A save damaged by the console powering off unexpectedly is saved as `.corrupt` instead of overwriting the original save.
+- **Continue runs:** You can leave a run from the pause menu by selecting "Exit to main menu", then "No" in a room without enemies,
+  and pick it up later with Start on the main menu (A). This works the same way as Rebirth's Continue feature (IsaacRecomp's Continuum mod, on by default; can be disabled in
+  `FunKey/isaac/mods/mods.txt`).
 - **Stability:** Memory stays consistent over the course of long playing sessions.
 - **Launchers:** An entry is added to both RetroFE and Gmenu2x and game supports being launched from either menu.
 
@@ -28,9 +31,9 @@ the game stays in the upstream checkout, and the changes from this project are a
 
 ## Limitations/Considerations
 
-- While the game is running (and ONLY while it's running), it overclocks the CPU to 1296 MHz to keep the framerate up. Obviously you should expect slightly worse battery life than you'd get even with heavier 3D titles (running at normal clock speed) on this system due to this.
+- Optional overclock setting in the FunKey menu (off by default). It sets the CPU to 1296 MHz while the game is running and can be toggled on and off (and ONLY while it's running). Obviously you should expect slightly worse battery life than you'd get even with heavier 3D titles (running at normal clock speed) on this system with it on. Without it the game runs at almost the same framerate (29.1 instead of 29.3 fps on average), with slightly longer room loads and floor transitions.
 - Every new floor pauses for about half a second when it starts.
-- In-progress runs aren't kept when you quit or power off: this is a limitation of the original game as well.
+- In-progress runs are only kept when you leave them with Continuum (above): quitting the game or powering off mid-run still loses the run, as in the original game.
 - Blurred shadows (title screen, cutscenes) are drawn sharp, or aren't drawn at all.
 - Not yet tested on stock Funkey OS
 
@@ -57,7 +60,7 @@ the game stays in the upstream checkout, and the changes from this project are a
 | Fn + A / Y, Fn + X / B | volume, brightness (the system's) | |
 
 The FunKey menu: VOLUME, BRIGHTNESS, ASPECT RATIO (4:3, or STRETCHED across the whole screen), SHOW FPS (pictures a
-second, top left) and EXIT GAME (A, then A again: the game's save is written). 
+second, top left), OVERCLOCK (ON: 1296 MHz while playing, OFF: the console's usual clock) and EXIT GAME (A, then A again: the game's save is written). 
 
 ## Layout
 
@@ -68,8 +71,8 @@ second, top left) and EXIT GAME (A, then A again: the game's save is written).
 | `scripts/` | `env.sh` (paths), `fetch-upstream.sh`, `export-patches.sh`, `build.sh host\|host-lean\|host-ref\|host-funkey\|funkey` |
 | `opk/` | the OPK's launcher, desktop entry and icon, and its RetroFE picture (`make-retrofe.py`) |
 | `scripts/funkey/` | correct maths library, ELF checks, CPU clock, `make-opk.sh`, `make-release.sh` (the release zip), `make-kit.sh` (a kit for testers) |
-| `scripts/measure/` | test workloads, tick and frame costs, ARM-vs-PC comparison, screenshots, qemu instruction counts |
-| `scripts/device/` | running on the console over SSH: the logic alone (`logic.sh`), the game's own loop on the screen playing a test script (`play.sh`), the menu and the version picker driven through the button daemon (`menu-test.sh`, `pick-test.sh`) |
+| `scripts/measure/` | test workloads, tick and frame costs, play run summaries, ARM-vs-PC comparison, screenshots, qemu instruction counts |
+| `scripts/device/` | running on the console over SSH: the logic alone (`logic.sh`), the game's own loop on the screen playing a test script (`play.sh`), the menu, the version picker and OVERCLOCK driven through the button daemon (`menu-test.sh`, `pick-test.sh`, `clock-test.sh`) |
 | `cmake/` | the FunKey toolchain |
 
 Builds run in WSL (Debian) as root, with the FunKey SDK and a GCC 14 for the FunKey already set up (`scripts/env.sh`
