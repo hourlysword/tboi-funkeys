@@ -32,9 +32,10 @@ press KEY_D 0.8; press KEY_R 0.8; grab 6-fps-on            # SHOW FPS: ON
 press KEY_Q 3.0; grab 7-game-stretched-fps                 # closed: the game, stretched, with the FPS
 press KEY_Q 1.0                                            # the menu again, on SHOW FPS
 press KEY_L 0.6; press KEY_U 0.8; press KEY_L 1.2          # SHOW FPS off, ASPECT RATIO back to 4:3
-press KEY_D 0.8; press KEY_D 0.8; grab 8-exit              # EXIT GAME
-press KEY_A 0.8; grab 9-exit-sure                          # "Are you sure ?"
-press KEY_B 0.8; grab 10-exit-back                         # B: the question taken back
+press KEY_D 0.8; press KEY_D 0.8; grab 8-overclock        # OVERCLOCK (left as it is: scripts/device/clock-test.sh)
+press KEY_D 0.8; grab 9-exit                               # EXIT GAME
+press KEY_A 0.8; grab 10-exit-sure                         # "Are you sure ?"
+press KEY_B 0.8; grab 11-exit-back                         # B: the question taken back
 press KEY_A 0.6; press KEY_A 3.0                           # A, A: quit
 pid=$(pidof isaac); [ -n "$pid" ] && echo "STILL RUNNING after EXIT GAME" >> $out/result.txt
 for i in 1 2 3 4 5; do pidof isaac > /dev/null || break; sleep 1; done

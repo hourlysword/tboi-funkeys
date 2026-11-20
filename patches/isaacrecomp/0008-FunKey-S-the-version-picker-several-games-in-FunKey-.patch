@@ -235,7 +235,7 @@ index c8b05e8..2628173 100644
  
      // ---- the test script (ISAAC_FUNKEY_SCRIPT): headless test scripts' commands, by tick
 diff --git a/rt/main.cpp b/rt/main.cpp
-index ff01d66..180a18f 100644
+index 14defea..e90e5b4 100644
 --- a/rt/main.cpp
 +++ b/rt/main.cpp
 @@ -74,6 +74,7 @@ extern bool g_shapeEvict; extern size_t g_shapeBudgetBytes, g_soundCacheBytes; e
@@ -246,7 +246,7 @@ index ff01d66..180a18f 100644
  #endif
  }
  // joystick_acceleration: how far the stick is pushed (0..1) -> movement factor. Below the dead zone nothing moves;
-@@ -765,6 +766,26 @@ int main(int argc, char** argv) {
+@@ -799,6 +800,26 @@ int main(int argc, char** argv) {
              if (choice < 0) { SDL_GL_DeleteContext(gl); SDL_DestroyWindow(win); SDL_Quit(); return 0; }
              saveIniValue(base + "isaac.ini", "game", found[choice].g->tag);
          }

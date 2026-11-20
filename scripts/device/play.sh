@@ -9,6 +9,8 @@
 #     results, read with scripts/measure/fkreport.py. TFK_RESULTS: where the results go (default testing/m3).
 #   TFK_DEVICE_BUNDLE: another bundle folder; TFK_MENU_OFF_OK=1: run although no menu is running on the console;
 #   NO_TICKMARKS=1: no per-tick lines in the log (long runs: the log is kept in the console's RAM until the end).
+#   TFK_BIN: the program to run on the console instead of the bundle's, e.g. one in an OPK mounted on the console
+#     (squashfs, as players run it: its pages are read and decompressed block by block, unlike from the card).
 #
 # Copies the bundle into /mnt/FunKey/isaac-dev (Isaac.exe the first time), stops the menu for the run (play-run.sh
 # puts it back), and copies out/<label> into testing/m3/<label>, with the last picture as a PNG.
@@ -50,6 +52,7 @@ if [ -n "${PROFILE:-}" ]; then
     prefix="TFK_FKPROF=1"
 fi
 [ -n "${NO_TICKMARKS:-}" ] && prefix="$prefix TFK_NO_TICKMARKS=1"   # (long runs: no per-tick lines in the log)
+[ -n "${TFK_BIN:-}" ] && prefix="$prefix TFK_BIN=$TFK_BIN"
 "$fk" "$prefix sh $dir/play-run.sh $label $mhz $dir/$workload $*"
 mkdir -p "$res"
 rm -rf "$res/$label"

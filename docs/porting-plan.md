@@ -1,12 +1,14 @@
 # Porting plan
 
-Status: M0–M6 done (2026-11-15). M4 (docs/m4-speed.md): the game plays on the console at full speed, 29 pictures a
-second on average in the floors (busy rooms included), drawing a picture 6–7 ms and the logic 7.5 ms a tick, room
-entries mostly under 0.3 s. M5 (docs/m5-menu.md): the FunKey menu (both picture modes), the RetroFE entry, the
-version picker, text checked at 240 px, the kit. M6 (docs/m6-rooms-memory.md): shorter room entries, memory that no
-longer creeps up. Upstream: [whylurking/IsaacRecomp](https://github.com/whylurking/IsaacRecomp)
-at `a2cfc66` (v1.5.0, pushed 2026-10-30), fetched into `$TFK_WORK/IsaacRecomp` by `scripts/fetch-upstream.sh` (a
-reference clone from the planning also sits in `IsaacRecomp/`, ignored by git).
+Status: M0–M6 done (2026-11-15), 1.0.0 released; M7 and M8 done (2026-11-19). M4 (docs/m4-speed.md): the game plays on
+the console at full speed, 29 pictures a second on average in the floors (busy rooms included), drawing a picture 6–7
+ms and the logic 7.5 ms a tick, room entries mostly under 0.3 s. M5 (docs/m5-menu.md): the FunKey menu (both picture
+modes), the RetroFE entry, the version picker, text checked at 240 px, the kit. M6 (docs/m6-rooms-memory.md): shorter
+room entries, memory that no longer creeps up. M7 (docs/m7-clock-and-code.md): OVERCLOCK in the menu. M8
+(docs/m8-upstream-1.7.md): the patches on upstream v1.7.0 (safer saves, Continuum). Upstream:
+[whylurking/IsaacRecomp](https://github.com/whylurking/IsaacRecomp) at `b156559` (v1.7.0, 2026-11-16; 1.0.0 was built
+on `a2cfc66`, v1.5.0), fetched into `$TFK_WORK/IsaacRecomp` by `scripts/fetch-upstream.sh` (a reference clone from the
+planning also sits in `IsaacRecomp/`, ignored by git).
 
 Numbers are marked *(upstream)* when they come from upstream's NOTES.md, *(console)* when measured on a FunKey in
 my other FunKey S projects, and *(estimate)* when they are guesses that a milestone below will replace with a measurement.
@@ -274,6 +276,24 @@ Each item measured before and after, in rough order of expected value:
 - [x] The pieces of rooms drawn before kept on the card (patch 0010, `saves/leaves_*`, up to 16 MB): other rooms after
       one session, entries over 150 ms 11 -> 4; the same rooms, none
 - [ ] The level generation when a floor starts (about 0.4 s of the game's own logic, once per floor): left
+
+### M7: the CPU clock in the menu
+
+- [x] OVERCLOCK in the FunKey menu (docs/m7-clock-and-code.md, patch 0011): 1296 MHz or the console's own clock (the
+      default), switched at once and kept in `launcher.cfg`; the launcher always puts the console's clock back. At
+      1008 MHz the play script still averages 29.1 pictures a second (29.3 at 1296); room entries and a new floor's
+      pause are longer
+- [x] Page faults in the game's log; keeping the program's code in memory (`mlock2`) measured: no gain, less memory
+      free, not kept
+
+### M8: on upstream v1.7.0
+
+- [x] The patches moved onto v1.7.0 (docs/m8-upstream-1.7.md, patch 0012): the game's code unchanged; safer saves
+      (read strictly, written through a `.tmp`, a damaged one kept as `.corrupt`); sound without a device
+- [x] Continuum (leave a run, carry on with it later) on by default, the room pieces still kept on the card with it
+- [x] Checked: the same pictures as before, the same game on ARM as on the PC, 1.0.0's saves load as they are,
+      Continuum with the FunKey's buttons; on the console Continuum, the speed (29.1 pictures a second at 1008 MHz, as
+      before) and OVERCLOCK
 
 ## Memory budget
 

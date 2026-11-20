@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Thu, 19 Nov 2026 18:36:39 -0500
+Subject: [PATCH] FunKey S: on upstream 1.7.0; Continuum on by default, the
+ room pieces kept on the card with it; test scripts work menus
+
+---
+ rt/funkey.cpp      |  7 ++++++-
+ rt/mods.cpp        | 13 ++++++++++++-
+ rt/raster.cpp      |  3 ++-
+ rt/render_soft.cpp |  1 +
+ 4 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/rt/funkey.cpp b/rt/funkey.cpp
+index c84a345..4b8b86d 100644
+--- a/rt/funkey.cpp
++++ b/rt/funkey.cpp
+@@ -23,7 +23,8 @@
+ // The console's facts and timings come from my other FunKey S projects; this file is written for this game.
+ //
+ // Testing: ISAAC_FUNKEY_SCRIPT=<file> plays a headless test script (tools: "<tick> down|up <code>", "click x y",
+-// "eval ...", "shot file", "quit"; and "menushot <item> <file> [1]", "aspect stretched|4:3") instead of the buttons, with the game's random numbers fixed; ISAAC_TICKMARKS=1
++// "eval ...", "shot file", "quit"; and "menushot <item> <file> [1]", "aspect stretched|4:3", "nav up|down|left|right|
++// confirm|back": the game's menus as the D-pad, A and B work them) instead of the buttons, with the game's random numbers fixed; ISAAC_TICKMARKS=1
+ // writes "OFKMEM" lines per tick and per picture (scripts/measure/tick-cost.py); ISAAC_FUNKEY_NO_POWEROFF=1 never
+ // runs powerdown (a SIGUSR1 then only saves and quits). The version picker with one game: ISAAC_FUNKEY_PICK_TEST=
+ // <name>,<name>... (main.cpp: the answer is only logged), ISAAC_FUNKEY_PICK_SHOTS=<prefix> (its pictures, below).
+@@ -862,6 +863,10 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+                     if (sscanf(c.arg.c_str(), "%d %255s %d", &it, path, &conf) >= 2) menuShot(it, conf != 0, path);
+                 }
+                 else if (c.op == "aspect") g_softStretch = c.arg == "stretched";   // (tests: the picture's shape)
++                else if (c.op == "nav") {   // (tests) menus as the FunKey's D-pad, A and B work them: "nav up|down|left|right|confirm|back"
++                    static const char* const kNav[] = {"up", "down", "left", "right", "confirm", "back"};   // (NAV_UP...NAV_BACK)
++                    for (int i = 0; i < 6; i++) if (c.arg == kNav[i]) padNavEvent(i);
++                }
+                 else if (c.op == "quit") quit = true;
+             }
+             inputPoll([&](int b, bool d) { if (b == B_MENU) onButton(b, d); });   // (Menu still opens the menu)
+diff --git a/rt/mods.cpp b/rt/mods.cpp
+index f255b25..6e2f941 100644
+--- a/rt/mods.cpp
++++ b/rt/mods.cpp
+@@ -156,6 +156,7 @@ void modsInit(const std::string& dir, const std::string& enabledList) {
+     // themselves. One that has a section in mods.txt but no file was deleted by the player: it stays deleted.
+     // (Before 1.5.0 that list was mods/installed.txt: read once, moved into mods.txt and removed.)
+     bool migrate = false;
++    std::vector<std::string> addedIds;   // (the mods put in the folder just now)
+     {
+         std::vector<std::string> legacy;
+         if (FILE* f = platformFopen(dir + "installed.txt", "rb")) {
+@@ -180,7 +181,7 @@ void modsInit(const std::string& dir, const std::string& enabledList) {
+                 if (!forced) { txt[id]; listed.insert(id); }
+                 continue;
+             }
+-            if (FILE* f = platformFopen(dir + b->file, "wb")) { fputs(b->text, f); fclose(f); names.push_back(b->file); logf("mods: added %s\n", b->file); }
++            if (FILE* f = platformFopen(dir + b->file, "wb")) { fputs(b->text, f); fclose(f); names.push_back(b->file); addedIds.push_back(id); logf("mods: added %s\n", b->file); }
+         }
+     }
+     std::string list = enabledList;
+@@ -199,6 +200,16 @@ void modsInit(const std::string& dir, const std::string& enabledList) {
+             else cur += c;
+         }
+     }
++#ifdef ISAAC_FUNKEY
++    // FunKey S: Continuum (leave a run and carry on with it later) is on by default, a handheld's runs being often cut
++    // short: when it is first put in the mods folder (a new player, or one coming from a version without it). From then
++    // on mods.txt has the player's choice, kept as it is.
++    if (!forced && std::find(addedIds.begin(), addedIds.end(), "continuum") != addedIds.end() &&
++        std::find(want.begin(), want.end(), "continuum") == want.end()) {
++        want.push_back("continuum");
++        logf("mods: Continuum turned on (the FunKey's default)\n");
++    }
++#endif
+     std::vector<std::string> files;
+     for (auto& n : names) if (n.size() > 4 && lower(n.substr(n.size() - 4)) == ".mod") files.push_back(n);
+     std::sort(files.begin(), files.end());
+diff --git a/rt/raster.cpp b/rt/raster.cpp
+index 1a57779..61c62a4 100644
+--- a/rt/raster.cpp
++++ b/rt/raster.cpp
+@@ -721,7 +721,8 @@ void buildIdentity(uint8_t out[20]) {
+ 
+ void leafDiskOpen(const std::string& dir, uint32_t swfLen) {
+     if (getenv("ISAAC_NO_LEAFDISK")) { logf("[leafdisk] off (ISAAC_NO_LEAFDISK)\n"); return; }
+-    for (auto& m : modsAll()) if (m.enabled) { logf("[leafdisk] off: mods are on (some change shapes)\n"); return; }
++    // (Continuum only writes a run's variables down and puts them back: it changes no shapes, so the pieces stay valid)
++    for (auto& m : modsAll()) if (m.enabled && m.engine != "continuum") { logf("[leafdisk] off: mods are on (some change shapes)\n"); return; }
+     DiskFileHead want; memset(&want, 0, sizeof want);
+     memcpy(want.magic, "ISAACLV1", 8); want.version = 1; want.sub = (uint32_t)leafSub(); want.swfLen = swfLen;
+     buildIdentity(want.build);
+diff --git a/rt/render_soft.cpp b/rt/render_soft.cpp
+index 2220b9b..ce64c93 100644
+--- a/rt/render_soft.cpp
++++ b/rt/render_soft.cpp
+@@ -970,6 +970,7 @@ void renderChooser(int winW, int winH, const std::string& title, const std::vect
+ }
+ void renderTouchSticks(const TouchStick*, int) {}
+ void renderPauseButton(double, double, double, double) {}
++void renderSetOutput(int, int) {}   // (the GL renderer's render_height: this one draws at the size it is given)
+ void renderPreload(const std::vector<PreKey>&, int, int, const std::function<void(float)>&) {}
+ size_t renderPreloadPending() { return 0; }
+ std::vector<PreKey> renderTakeLearned() { return {}; }

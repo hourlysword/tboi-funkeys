@@ -34,7 +34,7 @@ Measured on the console with a whole-system profile (the game's CPU time per tic
  6 files changed, 311 insertions(+), 67 deletions(-)
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 954e6e3..e0fe3c3 100644
+index 91d9865..ca38060 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -138,6 +138,19 @@ add_library(isaacgen STATIC ${GEN_SRC})
@@ -58,10 +58,10 @@ index 954e6e3..e0fe3c3 100644
  # the mods that come with the program (mods/*.mod): built in, so the program can write them into a new "mods" folder
  # (Android has no package folder to copy them from). Regenerated when a .mod file changes.
 diff --git a/rt/audio.cpp b/rt/audio.cpp
-index 8871d81..cdf85e2 100644
+index dbe4f27..e837e50 100644
 --- a/rt/audio.cpp
 +++ b/rt/audio.cpp
-@@ -180,8 +180,8 @@ static bool refill(Chan& c) {
+@@ -181,8 +181,8 @@ static bool refill(Chan& c) {
  
  static void mix(void* userdata, Uint8* stream, int len) {
      (void)userdata;
@@ -72,7 +72,7 @@ index 8871d81..cdf85e2 100644
      static float s_mix[4096 * 2];
      int frames = std::min(4096, len / (int)(sizeof(int16_t) * 2)); float* out = s_mix;
  #else
-@@ -234,8 +234,9 @@ static void mix(void* userdata, Uint8* stream, int len) {
+@@ -235,8 +235,9 @@ static void mix(void* userdata, Uint8* stream, int len) {
              auto cr = [t](float pm, float p0, float p1, float p2) {
                  return p0 + 0.5f * t * (p1 - pm + t * (2 * pm - 5 * p0 + 4 * p1 - p2 + t * (3 * (p0 - p1) + p2 - pm)));
              };
@@ -84,7 +84,7 @@ index 8871d81..cdf85e2 100644
              if (hasEnv) { float el, er; envStep(c, el, er); l *= el; r *= er; }
              out[i * 2] += l * lv; out[i * 2 + 1] += r * rv;
              POS_ADV();
-@@ -252,17 +253,17 @@ static void mix(void* userdata, Uint8* stream, int len) {
+@@ -253,17 +254,17 @@ static void mix(void* userdata, Uint8* stream, int len) {
          if (c.decOk) c.curPub.store((double)(c.pcm ? c.pcmPos : c.dec.currentPCMFrame) - c.bufLen + c.pos, std::memory_order_relaxed);
          if (ended) { if (c.decOk && !c.pcm) drmp3_uninit(&c.dec); c.pcm.reset(); c.rec.reset(); c.decOk = false; c.active.store(false, std::memory_order_release); }
      }
@@ -108,7 +108,7 @@ index 8871d81..cdf85e2 100644
  }
  
  // ---- output device
-@@ -308,6 +309,10 @@ static bool openDevice(const std::string& name) {
+@@ -311,6 +312,10 @@ static bool openDevice(const std::string& name, bool quiet = false) {
      want.freq = (kIsAndroid || kIsSwitch) ? 48000 : kRate; want.format = kIsPsp ? AUDIO_S16SYS : AUDIO_F32SYS; want.channels = 2; want.samples = kIsAndroid ? 512 : 1024; want.callback = mix;   // (Android: ~11 ms)
  #ifdef ISAAC_FUNKEY
      static int s_speaker = 1; want.userdata = &s_speaker;   // (the device's mix goes to the FunKey's speaker: see mix())
@@ -118,7 +118,7 @@ index 8871d81..cdf85e2 100644
 +    want.format = AUDIO_S16SYS;
  #endif
      SDL_AudioDeviceID d = SDL_OpenAudioDevice(name.empty() ? nullptr : name.c_str(), 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
-     if (!d) { logf("audio: %s: %s\n", name.empty() ? "default device" : name.c_str(), SDL_GetError()); return false; }
+     if (!d) { if (!quiet) logf("audio: %s: %s\n", name.empty() ? "default device" : name.c_str(), SDL_GetError()); return false; }
 diff --git a/rt/funkey.cpp b/rt/funkey.cpp
 index 4f2a364..040b838 100644
 --- a/rt/funkey.cpp
@@ -161,7 +161,7 @@ index 4f2a364..040b838 100644
                  uint32_t r = ((c >> 16) & 255) + (t >> 1), g = ((c >> 8) & 255) + (t >> 2), b = (c & 255) + (t >> 1);
                  if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
 diff --git a/rt/platform.cpp b/rt/platform.cpp
-index 323e4af..8d13648 100644
+index e73b013..8e7b11a 100644
 --- a/rt/platform.cpp
 +++ b/rt/platform.cpp
 @@ -49,6 +49,14 @@ void platformInitLimits() {

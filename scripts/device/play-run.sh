@@ -35,13 +35,17 @@ trap restore EXIT INT TERM
 pkill -x gmenu2x; pkill -x retrofe
 sleep 1
 [ "$mhz" -gt 0 ] && ./cpuclock "$mhz" > /dev/null
-{ date; uname -a; echo "clock $(./cpuclock) MHz (was $old)"; cat /proc/meminfo; ps; } > "$out/before.txt" 2>&1
+{ date; uname -a; echo "clock $(./cpuclock) MHz (was $old)"; echo "program: ${TFK_BIN:-./isaac}"; cat /proc/meminfo; cat /proc/vmstat; ps; } > "$out/before.txt" 2>&1
 
 # The game's memory every 2 s (one background job only: BusyBox 1.32's wait hangs with two)
 ( while :; do
       if pid=$(pidof isaac); then
           awk '/^(VmRSS|VmHWM|RssAnon|RssFile|VmSwap):/ {printf "%s %s ", $1, $2}' "/proc/$pid/status"
           awk '/^(MemAvailable|SwapFree):/ {printf "%s %s ", $1, $2}' /proc/meminfo
+          # pages it waited for (major faults), and the system's: file pages read again soon after being dropped
+          # (workingset_refault: mostly program code), swap traffic
+          awk '{printf "majflt %s ", $12}' "/proc/$pid/stat"
+          awk '/^(pgmajfault|workingset_refault|pswpin|pswpout) / {printf "%s %s ", $1, $2}' /proc/vmstat
           echo
       fi
       sleep 2
@@ -59,7 +63,8 @@ fi
 t0=$(cut -d' ' -f1 /proc/uptime)
 # (TFK_NO_TICKMARKS=1: without the per-tick lines, for long runs: the log is in /tmp, which is RAM)
 marks="ISAAC_TICKMARKS=1"; [ -n "${TFK_NO_TICKMARKS:-}" ] && marks="ISAAC_FUNKEY_RUN=1"
-env "$@" ISAAC_HOME="$here" ISAAC_FUNKEY_SCRIPT="$script" $marks ISAAC_FUNKEY_NO_POWEROFF=1 ./isaac > "$log" 2>&1
+# (TFK_BIN: the program from elsewhere, e.g. an OPK mounted as players run it; play.sh)
+env "$@" ISAAC_HOME="$here" ISAAC_FUNKEY_SCRIPT="$script" $marks ISAAC_FUNKEY_NO_POWEROFF=1 "${TFK_BIN:-./isaac}" > "$log" 2>&1
 status=$?
 t1=$(cut -d' ' -f1 /proc/uptime)
 kill "$sampler" 2> /dev/null

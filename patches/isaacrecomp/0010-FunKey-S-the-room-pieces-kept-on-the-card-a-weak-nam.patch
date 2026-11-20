@@ -28,10 +28,10 @@ again while a sweep is in progress.
  5 files changed, 254 insertions(+), 6 deletions(-)
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2d09839..dfc552a 100644
+index 7725295..a6937dd 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -240,6 +240,7 @@ if(NOT PSP)
+@@ -245,6 +245,7 @@ if(NOT PSP)
    if(ISAAC_FUNKEY)
      target_compile_definitions(isaac PRIVATE ISAAC_FUNKEY)
      target_compile_options(isaac PRIVATE -Wno-psabi)   # (GCC's note that an ABI changed in GCC 7.1, on every call)
@@ -111,7 +111,7 @@ index c358b01..83ea804 100644
      if (g_powerReq) logf("[funkey] stopping for the power-off\n");
      else if (g_stopReq) logf("[funkey] stopping: asked to\n");
 diff --git a/rt/main.cpp b/rt/main.cpp
-index 1f4ec81..8288f65 100644
+index 8ebfe58..d5ced90 100644
 --- a/rt/main.cpp
 +++ b/rt/main.cpp
 @@ -76,6 +76,7 @@ void rasterTrim(size_t budget);
@@ -122,7 +122,7 @@ index 1f4ec81..8288f65 100644
  #endif
  }
  // joystick_acceleration: how far the stick is pushed (0..1) -> movement factor. Below the dead zone nothing moves;
-@@ -808,6 +809,9 @@ int main(int argc, char** argv) {
+@@ -842,6 +843,9 @@ int main(int argc, char** argv) {
      g_joyAccel = cfg.joystickAcceleration;
      applyLoadPatches();
      logf("SWF loaded: v%d, %dx%d @ %.0f fps, recompiled stage %dx%d\n", g_movie.version, g_movie.width, g_movie.height, g_movie.frameRate, g_stageW, g_stageH);
@@ -133,7 +133,7 @@ index 1f4ec81..8288f65 100644
      if (kIsAndroid || getenv("ISAAC_MOBILE_FILTERS")) { g_renderCfg.filterBudget = 4; g_renderCfg.filterMaxAge = 3; g_renderCfg.filterLowRes = true; }
      g_renderCfg.rasterWaitMs = headless ? 1e9 : kIsSwitch ? 3.0 : 6.0;   // (testing: always complete, deterministic)
 diff --git a/rt/raster.cpp b/rt/raster.cpp
-index 60fccbe..66da0fd 100644
+index 75ff1c8..1a57779 100644
 --- a/rt/raster.cpp
 +++ b/rt/raster.cpp
 @@ -17,6 +17,14 @@
@@ -151,7 +151,7 @@ index 60fccbe..66da0fd 100644
  
  extern "C" __thread int plutovg_texture_smooth;
  namespace fl {
-@@ -483,6 +491,212 @@ struct LeafRaster { std::vector<uint32_t> px; int w = 0, h = 0; uint64_t lastUse
+@@ -563,6 +571,212 @@ struct LeafRaster { std::vector<uint32_t> px; int w = 0, h = 0; uint64_t lastUse
  struct LeafPlan { LeafKey key; DisplayObject* d; Mat mm; CX cx; bool hasCx; int bx, by, w, h, dx, dy; };
  static std::unordered_map<LeafKey, LeafRaster*, LeafHash> g_leafCache;
  static size_t g_leafBytes = 0; static uint64_t g_leafSeq = 0;
@@ -364,7 +364,7 @@ index 60fccbe..66da0fd 100644
  
  struct DrawCtx {
      bool collect = false; int clip = 0; BitmapData* bd = nullptr;
-@@ -522,7 +736,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
+@@ -602,7 +816,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
      if (!leafIdent(d, def, variant)) return false;
      RectF b; if (!contentBounds(d, b) || !b.valid()) return false;
      double ftx = std::floor(m.tx), fty = std::floor(m.ty);
@@ -373,7 +373,7 @@ index 60fccbe..66da0fd 100644
      int fx = (int)std::lround((m.tx - ftx) * kSub), fy = (int)std::lround((m.ty - fty) * kSub);
      if (fx >= kSub) { fx = 0; ftx += 1; } if (fy >= kSub) { fy = 0; fty += 1; }
      Mat mm = m; mm.tx = (double)fx / kSub; mm.ty = (double)fy / kSub;
-@@ -742,12 +956,20 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+@@ -822,12 +1036,20 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
      if (!miss.empty()) {
          auto tr0 = std::chrono::steady_clock::now();
          struct AddMs { std::chrono::steady_clock::time_point t; ~AddMs() { g_leafRasterMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } } addMs{tr0};
@@ -395,7 +395,7 @@ index 60fccbe..66da0fd 100644
              LeafRaster* r = out[i] = new LeafRaster(); r->w = p.w; r->h = p.h; r->px.assign((size_t)p.w * p.h, 0);
              int bands = 1;
              if (nt > 1 && (size_t)p.w * p.h > 150000) bands = std::max(1, std::min(nt * 2, p.h / 48));
-@@ -758,6 +980,12 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+@@ -838,6 +1060,12 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
          static const int repeat = getenv("ISAAC_LEAF_REPEAT") ? atoi(getenv("ISAAC_LEAF_REPEAT")) : 0;   // (profiling: the same work again)
          for (int k = 0; k < repeat; k++)
              for (const Job& jb : jobs) { LeafRaster tmp; const LeafPlan& p = *miss[jb.leaf]; tmp.w = p.w; tmp.h = p.h; tmp.px.assign((size_t)p.w * p.h, 0); rasterLeafRows(p, &tmp, jb.y0, jb.y1); }

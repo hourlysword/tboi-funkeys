@@ -21,6 +21,8 @@ have it (the code here is written for this game):
 - **ASPECT RATIO**: `4:3` (black bars above and below) or `STRETCHED` (the whole screen: the 240x180 picture's rows
   stretched to 240); the game behind the menu is drawn again in its new shape.
 - **SHOW FPS**: the pictures drawn in the last second, top left.
+- **OVERCLOCK** (added in M7): the CPU at 1296 MHz while the game runs, or at the console's own clock, the default
+  ([m7-clock-and-code.md](m7-clock-and-code.md)).
 - **EXIT GAME**.
 - The game waits: its ticks stop, its sound pauses (`audioSetPaused`, the music resumes where it was), the
   speaker's amplifier is off (as FunKey-OS's emulators do); the game's clock skips the time spent in the menu, and

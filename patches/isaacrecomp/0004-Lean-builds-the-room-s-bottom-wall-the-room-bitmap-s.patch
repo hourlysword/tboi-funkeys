@@ -15,7 +15,7 @@ matches (hdx < 1, gridxs x (gridys - 75)); nothing in the game reads its size, a
  1 file changed, 17 insertions(+)
 
 diff --git a/rt/builtins.cpp b/rt/builtins.cpp
-index 369a02d..c2a7914 100644
+index 16d642a..1a46bda 100644
 --- a/rt/builtins.cpp
 +++ b/rt/builtins.cpp
 @@ -367,9 +367,26 @@ static uint32_t unpremul(uint32_t p) {

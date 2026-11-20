@@ -20,10 +20,10 @@ saveIniValue, shared now). It replaces Menu pressed twice to quit. Test hooks: t
  3 files changed, 298 insertions(+), 23 deletions(-)
 
 diff --git a/rt/audio.cpp b/rt/audio.cpp
-index cdf85e2..60ad60e 100644
+index e837e50..d869bc0 100644
 --- a/rt/audio.cpp
 +++ b/rt/audio.cpp
-@@ -95,6 +95,8 @@ static int g_genCounter = 0;
+@@ -96,6 +96,8 @@ static int g_genCounter = 0;
  static std::recursive_mutex g_devMu;   // g_dev can be reopened by the main thread (output device changes)
  void audioLock() { g_devMu.lock(); }
  void audioUnlock() { g_devMu.unlock(); }
@@ -465,10 +465,10 @@ index 040b838..c8b05e8 100644
      restoreConsole();
      return drawn;
 diff --git a/rt/main.cpp b/rt/main.cpp
-index 8431e97..ff01d66 100644
+index 3619dc9..14defea 100644
 --- a/rt/main.cpp
 +++ b/rt/main.cpp
-@@ -203,7 +203,7 @@ static void loadConfig(const std::string& path, Config& c) {
+@@ -208,7 +208,7 @@ static void loadConfig(const std::string& path, Config& c) {
      if (c.cacheMB < 32) c.cacheMB = 32;
  }
  // changes (or adds) "key = value" in isaac.ini, preserving the rest of the file

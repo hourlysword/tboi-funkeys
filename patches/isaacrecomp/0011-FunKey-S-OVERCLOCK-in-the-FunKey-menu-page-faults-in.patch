@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HourlySword <hourlysword.dev@gmail.com>
+Date: Thu, 19 Nov 2026 02:49:32 -0500
+Subject: [PATCH] FunKey S: OVERCLOCK in the FunKey menu; page faults in the
+ log
+
+---
+ rt/funkey.cpp | 80 +++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 65 insertions(+), 15 deletions(-)
+
+diff --git a/rt/funkey.cpp b/rt/funkey.cpp
+index 83ea804..c84a345 100644
+--- a/rt/funkey.cpp
++++ b/rt/funkey.cpp
+@@ -11,7 +11,8 @@
+ //   anyway); a picture is handed over again every 0.1 s when none is new. The text console is switched to graphics
+ //   with its keyboard off while the game runs.
+ // - Buttons: the button daemon's virtual keyboard (the /dev/input device with KEY_A and KEY_Q). Menu opens the FunKey
+-//   menu (volume, brightness, aspect ratio, pictures a second, exit game), in the style of FunKey-OS's emulators'.
++//   menu (volume, brightness, aspect ratio, pictures a second, the CPU clock, exit game), in the style of FunKey-OS's
++//   emulators'.
+ // - Several versions of the game in FunKey/isaac: main.cpp asks which one first (funkeyChooseGame), in the same style.
+ // - Power-off: FunKey-OS's `powerdown schedule 0.1` sends SIGUSR1 to the PID the launcher recorded and powers off 0.1 s
+ //   later. A thread of its own takes the signal at once (the loop may be inside a room build): it ends the scheduled
+@@ -45,6 +46,7 @@
+ #include <sys/wait.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/resource.h>
+ #if defined(__GLIBC__)
+ #include <malloc.h>   // (mallinfo2: the heap in use, on a PC)
+ #endif
+@@ -100,6 +102,10 @@ void rawLog(const char* fmt, ...) {
+     line[n++] = '\n';
+     if (write(STDERR_FILENO, line, n) < 0) {}
+ }
++// pages the program had to wait for (major page faults): its code read again from the OPK (squashfs: a whole block
++// decompressed for each), or its data from swap. (Keeping the code in memory, mlock2, was measured and gained nothing:
++// tboi-funkeys' docs/m7-clock-and-code.md.)
++long pageFaults() { rusage u; return getrusage(RUSAGE_SELF, &u) == 0 ? u.ru_majflt : 0; }
+ 
+ // ---------------------------------------------------------------- the text console
+ int g_ttyMode = -1, g_kbMode = -1;
+@@ -348,8 +354,8 @@ std::string iniPath() {
+     if (b.back() != '/') b += '/';
+     return b + "isaac.ini";
+ }
+-std::string iniGet(const std::string& key) {   // ("" when absent)
+-    std::ifstream f(iniPath()); std::string line;
++std::string cfgGet(const std::string& path, const std::string& key) {   // a "key = value" file's value ("" when absent)
++    std::ifstream f(path); std::string line;
+     auto trim = [](const std::string& s) { size_t a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r"); return a == std::string::npos ? std::string() : s.substr(a, b - a + 1); };
+     while (std::getline(f, line)) {
+         std::string t = trim(line); size_t eq = t.find('=');
+@@ -358,6 +364,45 @@ std::string iniGet(const std::string& key) {   // ("" when absent)
+     }
+     return "";
+ }
++std::string iniGet(const std::string& key) { return cfgGet(iniPath(), key); }   // ("" when absent)
++
++// ---------------------------------------------------------------- the CPU clock (OVERCLOCK in the menu)
++// The launcher (opk/isaac.sh) runs the game at the system's own clock unless FunKey/isaac/launcher.cfg asks for another
++// (cpu_mhz = 1296: OVERCLOCK on), puts the system's clock back when the game ends, and passes its clock tool
++// (ISAAC_FUNKEY_CPUCLOCK) and the system's clock (ISAAC_FUNKEY_SYSTEM_MHZ). OVERCLOCK in the menu switches between the
++// two at once and keeps the choice in launcher.cfg for the next start; without the tool (a PC, the play tests) the
++// choice is only kept.
++constexpr int kOverclockMhz = 1296;
++struct CpuClock { std::string tool; int system = 0; bool on = false; } g_clock;
++std::string launcherCfg() { std::string p = iniPath(); return p.substr(0, p.size() - strlen("isaac.ini")) + "launcher.cfg"; }
++int clockNow() {   // the CPU clock in MHz (0: unknown)
++    if (g_clock.tool.empty()) return 0;
++    FILE* p = popen(("\"" + g_clock.tool + "\" 2> /dev/null").c_str(), "r");
++    if (!p) return 0;
++    int v = 0; if (fscanf(p, "%d", &v) != 1) v = 0;
++    pclose(p);
++    return v;
++}
++void clockInit() {
++    const char* tool = getenv("ISAAC_FUNKEY_CPUCLOCK"); const char* sys = getenv("ISAAC_FUNKEY_SYSTEM_MHZ");
++    if (tool && *tool && access(tool, X_OK) == 0) g_clock.tool = tool;
++    g_clock.system = sys ? atoi(sys) : 0;
++    const int cur = clockNow();
++    const std::string cfg = cfgGet(launcherCfg(), "cpu_mhz");   // (no file: off)
++    g_clock.on = cur > 0 && g_clock.system > 0 ? cur > g_clock.system : !cfg.empty() && cfg != "0";
++    logf("[funkey] CPU clock %d MHz, the system's %d MHz: OVERCLOCK %s\n", cur, g_clock.system, g_clock.on ? "ON" : "OFF");
++}
++void clockSet(bool on) {
++    g_clock.on = on;
++    saveIniValue(launcherCfg(), "cpu_mhz", on ? std::to_string(kOverclockMhz) : "0");
++    if (!g_clock.tool.empty() && g_clock.system > 0) {
++        const std::string mhz = std::to_string(on ? kOverclockMhz : g_clock.system);
++        const char* argv[] = {g_clock.tool.c_str(), mhz.c_str(), nullptr};
++        pid_t pid = 0;
++        if (posix_spawn(&pid, g_clock.tool.c_str(), nullptr, nullptr, (char* const*)argv, environ) == 0) waitpid(pid, nullptr, 0);
++    }
++    logf("[funkey] menu: OVERCLOCK %s, CPU clock %d MHz\n", on ? "ON" : "OFF", clockNow());
++}
+ 
+ // ---------------------------------------------------------------- FunKey-OS's commands: volume, brightness, amplifier
+ int fkGet(const char* tool) {   // `volume get`, `brightness get`: a percentage (-1: none, e.g. on a PC)
+@@ -402,11 +447,12 @@ struct FkSetting {
+ //   VOLUME and BRIGHTNESS: FunKey-OS's own (its volume and brightness commands keep them for the next start), in
+ //   steps of 10, as ten bars. ASPECT RATIO: 4:3 (black bars above and below) or STRETCHED (the whole screen). SHOW
+ //   FPS: the pictures drawn a second, in the top left corner. Those two are kept in isaac.ini (funkey_aspect,
+-//   funkey_fps).
++//   funkey_fps). OVERCLOCK: the CPU at 1296 MHz while the game runs (ON) or at the system's own clock (OFF), switched
++//   at once and kept in launcher.cfg for the launcher (clockSet).
+ // Tests: ISAAC_FUNKEY_MENU_RES, another folder for the fonts (a PC); the test script's "menushot <item> <file> [1]".
+ #include "font5x7.inc"
+-enum MenuItem { MI_VOLUME, MI_BRIGHTNESS, MI_ASPECT, MI_FPS, MI_EXIT, MI_COUNT };
+-const char* const kMenuTitles[MI_COUNT] = {"VOLUME", "BRIGHTNESS", "ASPECT RATIO", "SHOW FPS", "EXIT GAME"};
++enum MenuItem { MI_VOLUME, MI_BRIGHTNESS, MI_ASPECT, MI_FPS, MI_CLOCK, MI_EXIT, MI_COUNT };
++const char* const kMenuTitles[MI_COUNT] = {"VOLUME", "BRIGHTNESS", "ASPECT RATIO", "SHOW FPS", "OVERCLOCK", "EXIT GAME"};
+ constexpr int MW = 240, MH = 240, BOX_W = 180, BOX_H = 140, LINE = 18;
+ constexpr uint32_t kTextRgb = 0x555555u, kBoxRgb = 0xecececu;
+ constexpr uint32_t kDim = 155;   // what is left of the game behind (black at 100/255 over it)
+@@ -482,9 +528,9 @@ void menuItem(plutovg_canvas_t* cv, int item, float dy) {
+             menuText(cv, kMenuTitles[item], 22, mid - LINE);
+             menuBars(cv, mid + LINE, item == MI_VOLUME ? g_menu.volume : g_menu.brightness);
+             break;
+-        case MI_ASPECT: case MI_FPS:
++        case MI_ASPECT: case MI_FPS: case MI_CLOCK:
+             menuText(cv, kMenuTitles[item], 22, mid - LINE);
+-            snprintf(line, sizeof line, "<   %s   >", item == MI_ASPECT ? (g_softStretch ? "STRETCHED" : "4:3") : (g_menu.fps ? "ON" : "OFF"));
++            snprintf(line, sizeof line, "<   %s   >", item == MI_ASPECT ? (g_softStretch ? "STRETCHED" : "4:3") : (item == MI_FPS ? g_menu.fps : g_clock.on) ? "ON" : "OFF");
+             menuText(cv, line, 16, mid + LINE);
+             break;
+         default:
+@@ -554,6 +600,7 @@ bool menuRun(int outW, int outH) {
+                 renderFrame(outW, outH, 1.0); renderEndFrame(); menuBackground();   // (the game behind, in its new shape)
+                 break;
+             case MI_FPS: g_menu.fps = !g_menu.fps; saveIniValue(iniPath(), "funkey_fps", g_menu.fps ? "1" : "0"); break;
++            case MI_CLOCK: clockSet(!g_clock.on); break;
+             default: break;
+         }
+         dirty = true;
+@@ -567,7 +614,7 @@ bool menuRun(int outW, int outH) {
+                 case B_LEFT: case B_RIGHT: if (!g_menu.confirm) { change(b == B_RIGHT ? 1 : -1); held = b; repeatAt = now() + 0.5; } break;
+                 case B_A:
+                     if (g_menu.item == MI_EXIT) { if (g_menu.confirm) { exitGame = true; open = false; } else { g_menu.confirm = true; dirty = true; } }
+-                    else if (g_menu.item == MI_ASPECT || g_menu.item == MI_FPS) change(1);
++                    else if (g_menu.item == MI_ASPECT || g_menu.item == MI_FPS || g_menu.item == MI_CLOCK) change(1);
+                     break;
+                 case B_B: if (g_menu.confirm) { g_menu.confirm = false; dirty = true; } else open = false; break;
+                 case B_MENU: open = false; break;
+@@ -765,6 +812,7 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+     // the menu's settings (isaac.ini): the picture's shape, the pictures a second shown
+     { std::string a = iniGet("funkey_aspect"); if (a == "stretched") g_softStretch = true; else if (a == "4:3") g_softStretch = false; }
+     g_menu.fps = perfOverlay || iniGet("funkey_fps") == "1";
++    clockInit();
+     auto onButton = [&](int b, bool isDown) {
+         down[b] = isDown;
+         if (b == B_MENU) { if (isDown) menuReq = true; return; }   // the menu (menuRun), between two ticks
+@@ -795,7 +843,7 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+     int skipped = 0;   // pictures skipped in a row
+     // statistics, logged every 5 s (and drawn over the picture with performance = 1)
+     struct Win { int ticks = 0, frames = 0, skipped = 0, stalls = 0; double logic = 0, draw = 0, present = 0, gc = 0, worst = 0; } w;
+-    double winStart = now();
++    double winStart = now(); long winFaults = pageFaults();
+     std::vector<std::string> perfLines;
+     double fpsStart = now(); int fpsFrames = 0;   // (SHOW FPS: the pictures of the last second)
+     if (screen) notify("");
+@@ -843,6 +891,7 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+ 
+         // one logic tick
+         const double bm0 = g_bmDrawMs, lp0 = g_lazyParseMs, lr0 = g_leafRasterMs, rd0 = g_leanReadMs; const uint64_t lm0 = g_leafMisses, lh0 = g_leafHits, rn0 = g_leanReads, ld0 = leafDiskHits();
++        const long pf0 = pageFaults();
+         g_player.timeMs = scripted ? g_player.tick * 1000.0 / g_frameRate : (now() - clockStart) * 1000.0;
+         if (marks) logf("OFKMEM begin %u\n", g_player.tick);
+         double t0 = now(), c0 = threadCpuMs();
+@@ -892,10 +941,10 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+         // a long tick (mostly a room entry): what it was spent on
+         static const double slowMs = getenv("ISAAC_FUNKEY_SLOWMS") ? atof(getenv("ISAAC_FUNKEY_SLOWMS")) : 150;
+         if ((g1 - t0) * 1000 > slowMs)
+-            logf("[funkey] long tick %u: %.0f ms: logic %.0f (BitmapData.draw %.0f: %llu leaves rasterized or read in %.0f, %llu of them from the card, %llu reused; parsing %.0f, of it %llu reads %.0f), picture %.0f, collector %.0f\n",
++            logf("[funkey] long tick %u: %.0f ms: logic %.0f (BitmapData.draw %.0f: %llu leaves rasterized or read in %.0f, %llu of them from the card, %llu reused; parsing %.0f, of it %llu reads %.0f), picture %.0f, collector %.0f; page faults %ld\n",
+                  g_player.tick - 1, (g1 - t0) * 1000, (t1 - t0) * 1000, g_bmDrawMs - bm0, (unsigned long long)(g_leafMisses - lm0), g_leafRasterMs - lr0,
+                  (unsigned long long)(leafDiskHits() - ld0), (unsigned long long)(g_leafHits - lh0), g_lazyParseMs - lp0, (unsigned long long)(g_leanReads - rn0), g_leanReadMs - rd0,
+-                 pictureMs, (g1 - g0) * 1000);
++                 pictureMs, (g1 - g0) * 1000, pageFaults() - pf0);
+ 
+         // the clock: one tick every 1/30 s; a stall of more than half a second (a room being built) isn't caught up
+         next += dt;
+@@ -930,9 +979,10 @@ uint64_t funkeyPlay(bool perfOverlay) {   // (returns the number of pictures dra
+         if (t - winStart >= 5) {
+             int rss, swap, avail; memInfo(rss, swap, avail);
+             double secs = t - winStart; int n = std::max(1, w.ticks), nf = std::max(1, w.frames);
+-            logf("[funkey] %.1f s: %.1f ticks/s, %.1f pictures/s (%d skipped), stalls %d | per tick: logic %.1f ms, gc %.1f; per picture: draw %.1f, present %.1f; worst tick %.0f ms | rss %d MB, swap %d MB, available %d MB\n",
+-                 secs, w.ticks / secs, w.frames / secs, w.skipped, w.stalls, w.logic / n, w.gc / n, w.draw / nf, w.present / nf, w.worst, rss >> 10, swap >> 10, avail >> 10);
+-            w = Win(); winStart = t;
++            const long faults = pageFaults();
++            logf("[funkey] %.1f s: %.1f ticks/s, %.1f pictures/s (%d skipped), stalls %d | per tick: logic %.1f ms, gc %.1f; per picture: draw %.1f, present %.1f; worst tick %.0f ms | rss %d MB, swap %d MB, available %d MB, page faults %ld\n",
++                 secs, w.ticks / secs, w.frames / secs, w.skipped, w.stalls, w.logic / n, w.gc / n, w.draw / nf, w.present / nf, w.worst, rss >> 10, swap >> 10, avail >> 10, faults - winFaults);
++            w = Win(); winStart = t; winFaults = faults;
+         }
+     }
+     logf("[funkey] BitmapData.draw %.0f ms in all: %llu leaves rasterized in %.0f ms, %llu reused; parsing %.0f ms (shapes %u, their hit edges %u); shapes read from the game file: %llu, %llu KB in %.0f ms\n", g_bmDrawMs,

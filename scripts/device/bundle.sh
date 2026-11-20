@@ -29,6 +29,25 @@ python3 "$TFK_REPO/scripts/measure/workload.py" --start "$start" --scale "$scale
 cp "$dev/rooms.txt" "$dev/play.txt"
 for t in 400 1100 2500 4000 6000 9500 12000; do echo "$t shot /mnt/FunKey/isaac-dev/shots/s$t.ppm" >> "$dev/play.txt"; done
 sort -n -s -k1,1 "$dev/play.txt" -o "$dev/play.txt"
+# Continuum (upstream's mod; play.sh ... continuum.txt ISAAC_MODS=continuum): the start, then the run left from the
+# pause screen with "No" in the first room and taken up again with A on Start, as the FunKey's D-pad and A work the menus
+awk '$1 < 1000 && $2 != "shot"' "$dev/play.txt" > "$dev/continuum.txt"
+cat >> "$dev/continuum.txt" << 'EOF'
+1100 shot /mnt/FunKey/isaac-dev/shots/c1-room.ppm
+1110 down 80
+1112 up 80
+1160 nav down
+1190 nav down
+1220 nav confirm
+1250 shot /mnt/FunKey/isaac-dev/shots/c2-question.ppm
+1260 nav right
+1290 nav confirm
+1400 shot /mnt/FunKey/isaac-dev/shots/c3-menu.ppm
+1420 nav confirm
+1600 shot /mnt/FunKey/isaac-dev/shots/c4-resumed.ppm
+1601 eval continuum state
+1700 quit
+EOF
 cp "$TFK_REPO/scripts/device/play-run.sh" "$dev/"
 rm -f "$dev"/rooms-*.txt "$dev"/short-*.txt
 ls -la "$dev"

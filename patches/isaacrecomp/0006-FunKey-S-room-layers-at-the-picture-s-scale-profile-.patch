@@ -24,7 +24,7 @@ Subject: [PATCH] FunKey S: room layers at the picture's scale, profile-guided
  5 files changed, 53 insertions(+), 9 deletions(-)
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index e0fe3c3..2d09839 100644
+index ca38060..7725295 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -15,6 +15,18 @@ option(ISAAC_FUNKEY "FunKey S build (lean loading, PSP stage, one thread)" OFF)
@@ -47,7 +47,7 @@ index e0fe3c3..2d09839 100644
  if(NINTENDO_SWITCH)
    set(SDL2_INCLUDE_DIRS ${PORTLIBS}/include/SDL2)
 diff --git a/rt/builtins.cpp b/rt/builtins.cpp
-index c2a7914..130014c 100644
+index 1a46bda..0bf8d52 100644
 --- a/rt/builtins.cpp
 +++ b/rt/builtins.cpp
 @@ -383,9 +383,39 @@ static int roomLayerHeight(int w, int h) {
@@ -91,7 +91,7 @@ index c2a7914..130014c 100644
      b->transparent = argc > 2 ? truthy(argv[2]) : true;
      uint32_t fill = argc > 3 ? (uint32_t)toInt32(argv[3]) : 0xffffffffu;
 diff --git a/rt/platform.cpp b/rt/platform.cpp
-index 8d13648..4dcbca1 100644
+index 8e7b11a..834a250 100644
 --- a/rt/platform.cpp
 +++ b/rt/platform.cpp
 @@ -51,10 +51,10 @@ void platformInitLimits() {

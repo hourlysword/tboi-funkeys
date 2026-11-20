@@ -35,7 +35,7 @@ the logic takes 9.9 ms per tick on average, 12.8 ms at the 90th percentile; peak
  6 files changed, 81 insertions(+), 14 deletions(-)
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2271f28..1731fb7 100644
+index 0563256..b9bc770 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -8,6 +8,13 @@ add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-ffp-contract=off> $<
@@ -61,7 +61,7 @@ index 2271f28..1731fb7 100644
    set(ISAAC_GEN_DIR genpsp CACHE STRING "")   # 363x272 stage (_root at 56.7 %): the PSP screen's height
  elseif(NINTENDO_SWITCH OR ANDROID)
    set(ISAAC_GEN_DIR gen720 CACHE STRING "")
-@@ -154,6 +161,9 @@ endif()
+@@ -159,6 +166,9 @@ endif()
  # lean SWF loading (PSP; on PC for testing): the SWF is decompressed to a cache file, sounds read from it on demand,
  # shapes parsed when first drawn
  option(ISAAC_LEAN "Lean SWF loading (PSP memory budget)" OFF)
@@ -71,7 +71,7 @@ index 2271f28..1731fb7 100644
  if(ANDROID)
    add_library(isaac SHARED ${RT_SRC})
    set_target_properties(isaac PROPERTIES OUTPUT_NAME main)   # libmain.so: the name SDL's activity loads
-@@ -191,7 +201,16 @@ if(NOT PSP)
+@@ -196,7 +206,16 @@ if(NOT PSP)
    target_link_libraries(isaac PRIVATE isaacgen plutovg)
    if(ISAAC_LEAN)
      target_compile_definitions(isaac PRIVATE FL_LEAN)
@@ -89,7 +89,7 @@ index 2271f28..1731fb7 100644
    endif()
  endif()
  # on Windows it can't be named isaac.exe: Steam's Isaac.exe (with the game data) usually sits in the same folder
-@@ -222,6 +241,8 @@ elseif(NINTENDO_SWITCH)
+@@ -227,6 +246,8 @@ elseif(NINTENDO_SWITCH)
      COMMAND ${DEVKITPRO}/tools/bin/nacptool --create "${APP_TITLE}" "${APP_AUTHOR}" "${APP_VERSION}" isaac.nacp
      COMMAND ${DEVKITPRO}/tools/bin/elf2nro $<TARGET_FILE:isaac> isaac.nro --icon=${CMAKE_SOURCE_DIR}/switch/icon.jpg --nacp=isaac.nacp
      COMMENT "Generating isaac.nro")
@@ -99,10 +99,10 @@ index 2271f28..1731fb7 100644
    if(TARGET SDL2::SDL2main)
      target_link_libraries(isaac PRIVATE SDL2::SDL2main)
 diff --git a/rt/audio.cpp b/rt/audio.cpp
-index 9e5923c..91c8c2f 100644
+index 866c808..8bef43b 100644
 --- a/rt/audio.cpp
 +++ b/rt/audio.cpp
-@@ -82,7 +82,7 @@ static void pcmStore(const SoundDef* s, std::shared_ptr<PcmClip> c) {
+@@ -83,7 +83,7 @@ static void pcmStore(const SoundDef* s, std::shared_ptr<PcmClip> c) {
          g_pcmBytes -= old->second->s.size() * 2; g_pcmCache.erase(old);
      }
  }
@@ -134,7 +134,7 @@ index 7c56c6e..6db1f67 100644
      fprintf(stderr, "[rngcall] %llu %s", (unsigned long long)g_rngCalls, what);
      for (int i = 2; i < n; i++) { Dl_info di; if (dladdr(bt[i], &di) && di.dli_fbase) fprintf(stderr, " 0x%lx", (unsigned long)((char*)bt[i] - (char*)di.dli_fbase)); }
 diff --git a/rt/main.cpp b/rt/main.cpp
-index af17aa7..019006d 100644
+index c63825d..8cc3e38 100644
 --- a/rt/main.cpp
 +++ b/rt/main.cpp
 @@ -41,6 +41,7 @@
@@ -154,7 +154,7 @@ index af17aa7..019006d 100644
  }
  // joystick_acceleration: how far the stick is pushed (0..1) -> movement factor. Below the dead zone nothing moves;
  // just past it the player moves at 40% of its speed, rising linearly to 100% at 75% of the stick's travel.
-@@ -288,8 +291,9 @@ static void javaVoid(const char* method, const char* arg = nullptr) {
+@@ -293,8 +296,9 @@ static void javaVoid(const char* method, const char* arg = nullptr) {
  // ---- test script (--script): "tick action arg" per line
  struct ScriptCmd { uint32_t tick; std::string op; std::string arg; };
  
@@ -166,7 +166,7 @@ index af17aa7..019006d 100644
  #include <execinfo.h>
  #include <signal.h>
  #include <sys/time.h>
-@@ -320,6 +324,14 @@ static void profSampleStop() {
+@@ -325,6 +329,14 @@ static void profSampleStop() {
  static void profSampleStart() {}
  static void profSampleStop() {}
  #endif
@@ -181,7 +181,7 @@ index af17aa7..019006d 100644
  static double g_benchAlpha = 1.0;
  // Windowed: fit the whole window (with its title bar) inside the usable screen area, without going under the
  // taskbar, keeping the aspect ratio of the requested size, and centered.
-@@ -539,6 +551,12 @@ int main(int argc, char** argv) {
+@@ -558,6 +570,12 @@ int main(int argc, char** argv) {
  #endif
  #ifdef FL_LEAN
      fl::g_leanSwf = getenv("ISAAC_NOLEAN") == nullptr; fl::g_leanCacheDir = pref;   // (lean loading: PSP / tests)
@@ -194,7 +194,7 @@ index af17aa7..019006d 100644
  #endif
      loadConfig(base + "isaac.ini", cfg);
      {   // mods: the "mods" folder next to the program (mods.h), turned on with `mods =` in isaac.ini
-@@ -838,17 +856,34 @@ int main(int argc, char** argv) {
+@@ -873,17 +891,34 @@ int main(int argc, char** argv) {
                  if (k != aimKey) { if (aimKey) keyEvent(aimKey, 0, false); if (k) keyEvent(k, 0, true); aimKey = k; }
              }
              monkeyStep();
@@ -230,7 +230,7 @@ index af17aa7..019006d 100644
              if (stats) {
                  int nb = entityCount();
                  logicMs.push_back(lms); ballCount.push_back(nb); allocs.push_back((double)gcCount() - (double)heap0);
-@@ -1910,6 +1945,13 @@ int main(int argc, char** argv) {
+@@ -1992,6 +2027,13 @@ int main(int argc, char** argv) {
      }
      if (stats) { rasterMemStats(); logf("[mem] heap objects %zu, SWF %zu MB, GC total %.1f ms\n", gcCount(), g_movie.data.size() >> 20, g_gcMs); }
      logf("logic ticks: %u, frames drawn: %llu\n", g_player.tick, (unsigned long long)renderedFrames);
@@ -245,7 +245,7 @@ index af17aa7..019006d 100644
      if (!wavPath.empty()) { fl::audioDumpClose(); }
      soundStopAll();
 diff --git a/rt/platform.cpp b/rt/platform.cpp
-index da0640b..323e4af 100644
+index 9b6fa15..e73b013 100644
 --- a/rt/platform.cpp
 +++ b/rt/platform.cpp
 @@ -45,8 +45,9 @@ void platformInitLimits() {
@@ -289,10 +289,10 @@ index da0640b..323e4af 100644
  #elif defined(__SWITCH__)
      return 2;
 diff --git a/rt/raster.cpp b/rt/raster.cpp
-index 9b088f7..3e33d10 100644
+index 828cb85..3221513 100644
 --- a/rt/raster.cpp
 +++ b/rt/raster.cpp
-@@ -510,7 +510,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
+@@ -590,7 +590,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
      for (int i = 0; i < 4; i++) { double x, y; mm.apply(xs[i], ys[i], x, y); lx = std::min(lx, x); hx = std::max(hx, x); ly = std::min(ly, y); hy = std::max(hy, y); }
      int x0 = (int)std::floor(lx) - 2, y0 = (int)std::floor(ly) - 2, x1 = (int)std::ceil(hx) + 2, y1 = (int)std::ceil(hy) + 2;
      p.w = x1 - x0; p.h = y1 - y0;
@@ -301,7 +301,7 @@ index 9b088f7..3e33d10 100644
      if (p.w <= 0 || p.h <= 0 || p.w > 1024 || p.h > 1024) return false;   // (memory: big ones painted straight into the bitmap)
  #else
      if (p.w <= 0 || p.h <= 0 || p.w > 4096 || p.h > 4096) return false;
-@@ -683,7 +683,7 @@ static void evictLeaves() {
+@@ -763,7 +763,7 @@ static void evictLeaves() {
      for (auto& kv : g_leafCache) order.push_back({kv.second->lastUse, kv.first});
      std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
      for (auto& o : order) {

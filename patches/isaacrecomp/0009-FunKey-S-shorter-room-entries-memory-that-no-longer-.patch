@@ -39,7 +39,7 @@ ISAAC_TIMELINE_KB, ISAAC_SHAPE_KB, ISAAC_LEAF_SUB, ISAAC_LEAF_REPEAT, ISAAC_LEAN
  10 files changed, 218 insertions(+), 21 deletions(-)
 
 diff --git a/rt/builtins.cpp b/rt/builtins.cpp
-index 130014c..6e78930 100644
+index 0bf8d52..5587487 100644
 --- a/rt/builtins.cpp
 +++ b/rt/builtins.cpp
 @@ -277,12 +277,12 @@ static Value mc_prevFrame(Act& a, Value t, int, Value*) { if (MovieClip* c = asC
@@ -145,7 +145,7 @@ index fc175b0..0570196 100644
  // ---------------------------------------------------------------- Values
  enum VT : uint8_t { T_UNDEF = 0, T_NULL, T_BOOL, T_NUM, T_STR, T_OBJ, T_HOLE };
 diff --git a/rt/display.cpp b/rt/display.cpp
-index 3ff19d0..75f1730 100644
+index 8f4ad36..c701f4b 100644
 --- a/rt/display.cpp
 +++ b/rt/display.cpp
 @@ -59,6 +59,7 @@ void DisplayObject::trace(Tracer& tr) { Object::trace(tr); tr.mark(parent); tr.m
@@ -164,7 +164,7 @@ index 3ff19d0..75f1730 100644
      return c;
  }
  
-@@ -969,7 +971,7 @@ static bool hitShape(DisplayObject* d, const Mat& world, double gx, double gy, b
+@@ -978,7 +980,7 @@ static bool hitShape(DisplayObject* d, const Mat& world, double gx, double gy, b
          ShapeDef* s = (ShapeDef*)((ShapeObj*)d)->def;
          if (lx < s->bounds.x0 || lx > s->bounds.x1 || ly < s->bounds.y0 || ly > s->bounds.y1) return false;
          if (!shapeFlag) return true;
@@ -173,7 +173,7 @@ index 3ff19d0..75f1730 100644
          // global point in whole twips (as Ruffle), then local twips rounded
          double tgx = std::round(gx * 20.0) / 20.0, tgy = std::round(gy * 20.0) / 20.0;
          inv.apply(tgx, tgy, lx, ly);
-@@ -985,7 +987,7 @@ static void hitDebugRec(DisplayObject* d, const Mat& world, double gx, double gy
+@@ -994,7 +996,7 @@ static void hitDebugRec(DisplayObject* d, const Mat& world, double gx, double gy
      Mat inv; if (!world.invert(inv)) return;
      double lx, ly; inv.apply(gx, gy, lx, ly);
      if (d->kind == OK_SHAPE) {
@@ -183,7 +183,7 @@ index 3ff19d0..75f1730 100644
          logf("[hitdbg] %s shape %d local %.4f %.4f vis=%d poly=%d exact=%d\n", targetPath(d->parent)->s.c_str(), s->id, lx, ly, (int)d->visible,
               (int)pointInPolys(shapeHitPolys(s), lx, ly), (int)hitShape(d, world, gx, gy, true));
 diff --git a/rt/display.h b/rt/display.h
-index 22d1646..19493fa 100644
+index 5b7334b..735a17c 100644
 --- a/rt/display.h
 +++ b/rt/display.h
 @@ -86,6 +86,7 @@ struct MovieClip final : DisplayObject {
@@ -300,7 +300,7 @@ index 2628173..c358b01 100644
      else if (g_stopReq) logf("[funkey] stopping: asked to\n");
      else logf("[funkey] quitting (EXIT GAME in the menu, or the game)\n");
 diff --git a/rt/main.cpp b/rt/main.cpp
-index 180a18f..1f4ec81 100644
+index e90e5b4..8ebfe58 100644
 --- a/rt/main.cpp
 +++ b/rt/main.cpp
 @@ -71,6 +71,7 @@ int renderAtlasPages();
@@ -311,7 +311,7 @@ index 180a18f..1f4ec81 100644
  void rasterTrim(size_t budget);
  #ifdef ISAAC_FUNKEY
  void funkeyEarly(); uint64_t funkeyPlay(bool perfOverlay); void funkeyFinish();   // (funkey.cpp; funkeyPlay returns the pictures drawn)
-@@ -568,6 +569,10 @@ int main(int argc, char** argv) {
+@@ -587,6 +588,10 @@ int main(int argc, char** argv) {
      // with one thread using them: headless mode here, and the FunKey's own main loop), short sounds kept decoded 2 MB.
      // Decoded SWF bitmaps are trimmed to 1.5 MB after every tick (below)
      fl::g_shapeEvict = true; fl::g_shapeBudgetBytes = 5u << 20; fl::g_soundCacheBytes = 2u << 20;
@@ -323,10 +323,10 @@ index 180a18f..1f4ec81 100644
      loadConfig(base + "isaac.ini", cfg);
      {   // mods: the "mods" folder next to the program (mods.h), turned on with `mods =` in isaac.ini
 diff --git a/rt/raster.cpp b/rt/raster.cpp
-index bb78898..60fccbe 100644
+index 0f76663..75ff1c8 100644
 --- a/rt/raster.cpp
 +++ b/rt/raster.cpp
-@@ -522,7 +522,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
+@@ -602,7 +602,7 @@ static bool planLeaf(DisplayObject* d, const Mat& m, const CX& cx, LeafPlan& p)
      if (!leafIdent(d, def, variant)) return false;
      RectF b; if (!contentBounds(d, b) || !b.valid()) return false;
      double ftx = std::floor(m.tx), fty = std::floor(m.ty);
@@ -335,7 +335,7 @@ index bb78898..60fccbe 100644
      int fx = (int)std::lround((m.tx - ftx) * kSub), fy = (int)std::lround((m.ty - fty) * kSub);
      if (fx >= kSub) { fx = 0; ftx += 1; } if (fy >= kSub) { fy = 0; fty += 1; }
      Mat mm = m; mm.tx = (double)fx / kSub; mm.ty = (double)fy / kSub;
-@@ -714,6 +714,7 @@ static void evictLeaves() {
+@@ -794,6 +794,7 @@ static void evictLeaves() {
  }
  
  double g_bmDrawMs = 0;   // (diagnostics) time in BitmapData.draw
@@ -343,7 +343,7 @@ index bb78898..60fccbe 100644
  void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx);
  void bitmapDraw(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
      auto t0 = std::chrono::steady_clock::now();
-@@ -737,7 +738,10 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+@@ -817,7 +818,10 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
          for (auto& p : g_dc.plans) if (!g_leafCache.count(p.key) && seen.emplace(p.key, 0).second) miss.push_back(&p);
      }
      int nmiss = (int)miss.size();
@@ -354,7 +354,7 @@ index bb78898..60fccbe 100644
          std::vector<LeafRaster*> out(miss.size());
          struct Job { int leaf, y0, y1; size_t cost; };
          std::vector<Job> jobs;
-@@ -751,6 +755,9 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+@@ -831,6 +835,9 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
          }
          std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.cost > b.cost; });
          parallelFor((int)jobs.size(), [&](int j) { const Job& jb = jobs[j]; rasterLeafRows(*miss[jb.leaf], out[jb.leaf], jb.y0, jb.y1); });
@@ -364,7 +364,7 @@ index bb78898..60fccbe 100644
          for (size_t i = 0; i < miss.size(); i++) { out[i]->lastUse = g_leafSeq; g_leafBytes += out[i]->px.size() * 4; g_leafCache[miss[i]->key] = out[i]; }
      }
      uint64_t t1 = prof ? SDL_GetPerformanceCounter() : 0;
-@@ -775,6 +782,17 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
+@@ -855,6 +862,17 @@ void bitmapDrawImpl(BitmapData* bd, Object* src, const Mat& m, const CX* cx) {
      g_dc = DrawCtx();
  }
  
@@ -383,7 +383,7 @@ index bb78898..60fccbe 100644
      size_t bm = 0; for (auto& kv : g_bmSurf) bm += (size_t)plutovg_surface_get_width(kv.second.s) * plutovg_surface_get_height(kv.second.s) * 4;
      size_t mor = 0; for (auto& kv : g_morphCache) for (auto& L : kv.second->layers) for (auto& P : L.fillPaths) mor += P.pts.size() * 4 + P.verbs.size();
 diff --git a/rt/swfdata.h b/rt/swfdata.h
-index 07e701b..f0ff2bc 100644
+index a8a6b33..892bd17 100644
 --- a/rt/swfdata.h
 +++ b/rt/swfdata.h
 @@ -97,10 +97,12 @@ struct ShapeDef : CharDef {
@@ -400,7 +400,7 @@ index 07e701b..f0ff2bc 100644
  extern bool g_leanSwf;
  
  // ---- Morph: paired edges
-@@ -175,7 +177,9 @@ struct SpriteDef : CharDef {
+@@ -176,7 +178,9 @@ struct SpriteDef : CharDef {
      std::unordered_map<std::string, int> labels;   // label → frame (1-based)
      std::unique_ptr<StreamInfo> stream;
      Str* exportName = nullptr;

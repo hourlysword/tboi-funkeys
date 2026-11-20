@@ -39,10 +39,10 @@ channel, menus 2.5-4.5 (no blurred shadows). Under qemu, drawing a floor 1 room 
  create mode 100644 rt/render_soft.cpp
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 1731fb7..9ba62b0 100644
+index b9bc770..0e11f00 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -158,6 +158,10 @@ if(PSP)   # own main loop and sceGu renderer
+@@ -163,6 +163,10 @@ if(PSP)   # own main loop and sceGu renderer
    list(REMOVE_ITEM RT_SRC rt/render.cpp rt/main.cpp rt/touch.cpp)
    list(APPEND RT_SRC rt/render_psp.cpp rt/main_psp.cpp)
  endif()
@@ -53,7 +53,7 @@ index 1731fb7..9ba62b0 100644
  # lean SWF loading (PSP; on PC for testing): the SWF is decompressed to a cache file, sounds read from it on demand,
  # shapes parsed when first drawn
  option(ISAAC_LEAN "Lean SWF loading (PSP memory budget)" OFF)
-@@ -241,7 +245,7 @@ elseif(NINTENDO_SWITCH)
+@@ -246,7 +250,7 @@ elseif(NINTENDO_SWITCH)
      COMMAND ${DEVKITPRO}/tools/bin/nacptool --create "${APP_TITLE}" "${APP_AUTHOR}" "${APP_VERSION}" isaac.nacp
      COMMAND ${DEVKITPRO}/tools/bin/elf2nro $<TARGET_FILE:isaac> isaac.nro --icon=${CMAKE_SOURCE_DIR}/switch/icon.jpg --nacp=isaac.nacp
      COMMENT "Generating isaac.nro")
@@ -63,10 +63,10 @@ index 1731fb7..9ba62b0 100644
  elseif(TARGET SDL2::SDL2)
    if(TARGET SDL2::SDL2main)
 diff --git a/rt/main.cpp b/rt/main.cpp
-index 019006d..0cfca62 100644
+index 8cc3e38..2157c62 100644
 --- a/rt/main.cpp
 +++ b/rt/main.cpp
-@@ -647,6 +647,9 @@ int main(int argc, char** argv) {
+@@ -666,6 +666,9 @@ int main(int argc, char** argv) {
      Uint32 sdlFlags = SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER;
  #endif
      if (headless && norender) sdlFlags = SDL_INIT_TIMER | SDL_INIT_AUDIO;
@@ -76,7 +76,7 @@ index 019006d..0cfca62 100644
      if (getenv("ISAAC_TOUCH")) cfg.touchControls = true;   // (testing on PC)
      if (cfg.touchControls) SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");   // touches are handled as such, not as a mouse
  #ifdef __ANDROID__
-@@ -689,6 +692,11 @@ int main(int argc, char** argv) {
+@@ -713,6 +716,11 @@ int main(int argc, char** argv) {
      if (cfg.fullscreen) wflags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
  #endif
      SDL_Window* win = nullptr; SDL_GLContext gl = nullptr;
@@ -88,8 +88,8 @@ index 019006d..0cfca62 100644
      if (!(headless && norender)) {   // (logic tests need neither a window nor a GPU)
          win = SDL_CreateWindow("The Binding of Isaac", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, cfg.width, cfg.height, wflags);
          if (win) { int w0, h0; SDL_GetWindowSize(win, &w0, &h0); if (h0 > 0) fl::g_windowAspect = (float)w0 / h0; }
-@@ -839,12 +847,14 @@ int main(int argc, char** argv) {
- 
+@@ -874,12 +882,14 @@ int main(int argc, char** argv) {
+     if (headless && getenv("ISAAC_FRAMETEST")) { rasterFrameSelfTest(); return 0; }
      if (headless) {
          // ---------------------------------------------------------------- test mode: deterministic, single thread
 +        // (the frame's size: the window's; without one, the software renderer's frame of --size)
@@ -104,7 +104,7 @@ index 019006d..0cfca62 100644
                  if (perfOn) renderOverlay(perfLines);
                  renderEndFrame();
                  renderScreenshot(file.c_str());
-@@ -898,8 +908,11 @@ int main(int argc, char** argv) {
+@@ -933,8 +943,11 @@ int main(int argc, char** argv) {
              SnapPtr snap = buildSnapshot(); snap->time = g_player.tick * dt;
              if (menuUi) menuUiFill(*snap);
              renderAdopt(snap);
@@ -118,7 +118,7 @@ index 019006d..0cfca62 100644
              renderFrame(dw, dh, g_benchAlpha);
              static const bool gpuTime = getenv("ISAAC_GLFINISH") != nullptr;   // (testing: render time includes the GPU's)
              if (gpuTime) { renderEndFrame(); renderFinish(); }
-@@ -907,6 +920,7 @@ int main(int argc, char** argv) {
+@@ -942,6 +955,7 @@ int main(int argc, char** argv) {
              if (perfOn) renderOverlay(perfLines);
              renderEndFrame();
              double ovms = (SDL_GetPerformanceCounter() - rt0) * 1000.0 / freq - rms;
@@ -126,7 +126,7 @@ index 019006d..0cfca62 100644
              if (stats) {
                  renderMs.push_back(rms);
                  static double sA, sC, sP, sE, sO; static int sN, sNodes, sCmds, sQuads, sDraws, sF, sFH; static long totRasters = 0;
-@@ -922,7 +936,8 @@ int main(int argc, char** argv) {
+@@ -957,7 +971,8 @@ int main(int argc, char** argv) {
                  if (rms > 20) logf("[stats] slow render tick %u: %.1f ms (rasterized %d in %.1f ms, upload %.1f MB, %d quads, %d draws, %d filters, %d new textures)\n",
                                     g_player.tick, rms, g_rstats.rasters, g_rstats.rasterMs, g_rstats.uploadMB, g_rstats.quads, g_rstats.draws, g_rstats.filters, g_rstats.texCreates);
              }
@@ -137,12 +137,12 @@ index 019006d..0cfca62 100644
      } else {
          // ---------------------------------------------------------------- normal mode
 diff --git a/rt/raster.cpp b/rt/raster.cpp
-index 3e33d10..678d267 100644
+index 3221513..4292099 100644
 --- a/rt/raster.cpp
 +++ b/rt/raster.cpp
-@@ -368,6 +368,19 @@ bool rasterizeSrc(const RasterSrc& src, double scale, Raster& out) {
-     plutovg_canvas_destroy(cv); plutovg_surface_destroy(s);
-     return true;
+@@ -448,6 +448,19 @@ void rasterFrameSelfTest() {
+         }
+     }
  }
 +bool rasterizeSrcAt(const RasterSrc& src, const Mat& m, int x0, int y0, int w, int h, Raster& out) {
 +    if (w <= 0 || h <= 0 || !src.def) return false;
@@ -161,12 +161,12 @@ index 3e33d10..678d267 100644
  
  // ============================================================ raster threads
 diff --git a/rt/raster.h b/rt/raster.h
-index ab1b03e..6103c3c 100644
+index 322aace..b26dce4 100644
 --- a/rt/raster.h
 +++ b/rt/raster.h
-@@ -12,6 +12,9 @@ bool contentBoundsSrc(const RasterSrc& s, RectF& b);
- struct Raster { std::vector<uint32_t> px; int w = 0, h = 0; double x0 = 0, y0 = 0, scale = 1; };
+@@ -19,6 +19,9 @@ struct Raster {
  bool rasterize(DisplayObject* d, double scale, Raster& out);
+ void rasterFrameSelfTest();
  bool rasterizeSrc(const RasterSrc& s, double scale, Raster& out);
 +// only the window (x0, y0)-(x0 + w, y0 + h) of the content drawn with the matrix m (render_soft.cpp: graphics far
 +// bigger than the screen, of which a part shows); out.x0 / y0 = x0 / y0, out.scale = 1

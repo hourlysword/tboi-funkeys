@@ -14,7 +14,7 @@ TFK_WORK="${TFK_WORK:-$HOME/tboi-funkeys-work}"
 # Upstream IsaacRecomp, pinned to a commit. Our changes are a patch series in patches/isaacrecomp, applied on a
 # "funkey" branch (scripts/fetch-upstream.sh, scripts/export-patches.sh).
 TFK_UPSTREAM_URL="https://github.com/whylurking/IsaacRecomp.git"
-TFK_UPSTREAM_COMMIT="a2cfc669c999f2503001e8331ee27b084dfec0a8"   # v1.5.0, 2026-10-30
+TFK_UPSTREAM_COMMIT="b156559d7ea4267c27b5e3e21928dea5a860fbfa"   # v1.7.0, 2026-11-16
 TFK_UPSTREAM="$TFK_WORK/IsaacRecomp"
 
 # The player's game: the Steam Isaac.exe (one or several versions), never committed. scripts/build.sh and the test
