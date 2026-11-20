@@ -33,7 +33,7 @@ the game stays in the upstream checkout, and the changes from this project are a
 
 - Optional overclock setting in the FunKey menu (off by default). It sets the CPU to 1296 MHz while the game is running (ONLY while it's running) and can be toggled on and off . Obviously you should expect slightly worse battery life than you'd get even with heavier 3D titles (running at normal clock speed) on this system with it on. Without it the game runs at almost the same framerate (29.1 instead of 29.3 fps on average), with slightly longer room loads and floor transitions.
 - Every new floor pauses for about half a second when it starts.
-- In-progress runs are only kept when you leave them with Continuum (above): quitting the game or powering off mid-run still loses the run, as in the original game.
+- In-progress runs are only saved when you exit them with Continuum (above): quitting the game or powering the console off mid-run still loses your run, same with the original game.
 - Blurred shadows (title screen, cutscenes) are drawn sharp, or aren't drawn at all.
 - Not yet tested on stock Funkey OS
 
